@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -41,6 +43,7 @@ func main() {
 		iniData    = flag.String("ini", "./inizh/Data/INI", "Path to CNC INI data directory")
 		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls when events are received")
 		timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
+		apiURL     = flag.String("api", "http://localhost:8080", "API endpoint URL for sending money data")
 		testMode   = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
 		help       = flag.Bool("help", false, "Show help information")
 	)
@@ -96,7 +99,7 @@ func main() {
 		if *testMode {
 			// Test mode: process file immediately
 			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
-			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout)
+			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout, *apiURL)
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
 			fmt.Println("Test mode complete. Exiting.")
 			return
@@ -110,7 +113,7 @@ func main() {
 			fmt.Printf("Replay file activity detected. Starting to monitor events...\n")
 
 			// Process the replay file until completion or timeout
-			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout)
+			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout, *apiURL)
 
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
 			fmt.Println("Returning to waiting mode for next replay...")
@@ -195,7 +198,7 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 }
 
 // processReplayFile processes a replay file until completion or timeout
-func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStore *iniparse.ObjectStore, powerStore *iniparse.PowerStore, upgradeStore *iniparse.UpgradeStore, pollDelay time.Duration, timeout time.Duration) int {
+func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStore *iniparse.ObjectStore, powerStore *iniparse.PowerStore, upgradeStore *iniparse.UpgradeStore, pollDelay time.Duration, timeout time.Duration, apiURL string) int {
 	// Create context with a much longer timeout to allow for real-time streaming
 	// The cncstats library will handle the actual timeout for new data
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -267,7 +270,16 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 			fmt.Println("  Polling memory values...")
 			vals := memReader.Poll()
 
-			// Create event data for storage
+			// Send money data via API immediately
+			fmt.Println("  Sending money data via API...")
+			err := sendMoneyData(apiURL, session.TimeStampBegin, uint32(chunk.TimeCode), vals)
+			if err != nil {
+				fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
+			} else {
+				fmt.Println("  Money data sent successfully")
+			}
+
+			// Create event data for storage (optional - for debugging)
 			eventData := EventData{
 				TimeCode:    uint32(chunk.TimeCode),
 				OrderCode:   uint32(chunk.OrderCode),
@@ -278,7 +290,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 				Timestamp:   time.Now().Format(time.RFC3339),
 			}
 
-			// Store event data
+			// Store event data (for debugging/session summary)
 			session.Events = append(session.Events, eventData)
 			session.EventCount = eventCount
 
@@ -338,6 +350,73 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 	}
 }
 
+// MoneyDataRequest represents the API request for player money data
+type MoneyDataRequest struct {
+	TimestampBegin time.Time `json:"timestamp_begin"`
+	Timecode       int64     `json:"timecode"`
+	Player1Money   int64     `json:"player_1_money"`
+	Player2Money   int64     `json:"player_2_money"`
+	Player3Money   int64     `json:"player_3_money"`
+	Player4Money   int64     `json:"player_4_money"`
+	Player5Money   int64     `json:"player_5_money"`
+	Player6Money   int64     `json:"player_6_money"`
+	Player7Money   int64     `json:"player_7_money"`
+	Player8Money   int64     `json:"player_8_money"`
+}
+
+// sendMoneyData sends player money data to the API endpoint
+func sendMoneyData(apiURL string, timeStampBegin string, timeCode uint32, playerMoney [8]int32) error {
+	// Parse the timestamp begin string to time.Time
+	timestampBegin, err := time.Parse(time.RFC3339, timeStampBegin)
+	if err != nil {
+		// If parsing fails, use current time
+		timestampBegin = time.Now()
+	}
+
+	// Create the request payload
+	request := MoneyDataRequest{
+		TimestampBegin: timestampBegin,
+		Timecode:       int64(timeCode),
+		Player1Money:   int64(playerMoney[0]),
+		Player2Money:   int64(playerMoney[1]),
+		Player3Money:   int64(playerMoney[2]),
+		Player4Money:   int64(playerMoney[3]),
+		Player5Money:   int64(playerMoney[4]),
+		Player6Money:   int64(playerMoney[5]),
+		Player7Money:   int64(playerMoney[6]),
+		Player8Money:   int64(playerMoney[7]),
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(request)
+	if err != nil {
+		return fmt.Errorf("failed to marshal money data: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", apiURL+"/player-money", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send the request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("API request failed with status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
 // sendSessionData sends the complete replay session data via API (placeholder)
 func sendSessionData(session *ReplaySession) {
 	fmt.Printf("\n=== SENDING SESSION DATA VIA API (PLACEHOLDER) ===\n")
@@ -374,6 +453,8 @@ func showHelp() {
 	fmt.Println("        Delay between memory polls when events are received (default: 100ms)")
 	fmt.Println("  -timeout duration")
 	fmt.Println("        Timeout for file inactivity before returning to waiting mode (default: 2m)")
+	fmt.Println("  -api string")
+	fmt.Println("        API endpoint URL for sending money data (default: http://localhost:8080)")
 	fmt.Println("  -test")
 	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
 	fmt.Println("  -help")
