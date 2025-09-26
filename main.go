@@ -7,12 +7,32 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	zhreader "github.com/bill-rich/cncmon/pkg/memmon"
 	"github.com/bill-rich/cncstats/pkg/iniparse"
 	"github.com/bill-rich/cncstats/pkg/zhreplay"
 )
+
+// EventData stores event information with money values for API transmission
+type EventData struct {
+	TimeCode    uint32   `json:"timeCode"`
+	OrderCode   uint32   `json:"orderCode"`
+	OrderName   string   `json:"orderName"`
+	PlayerID    uint32   `json:"playerId"`
+	PlayerName  string   `json:"playerName,omitempty"`
+	PlayerMoney [8]int32 `json:"playerMoney"`
+	Timestamp   string   `json:"timestamp"`
+}
+
+// ReplaySession stores complete replay session data
+type ReplaySession struct {
+	TimeStampBegin string      `json:"timeStampBegin"`
+	Events         []EventData `json:"events"`
+	EventCount     int         `json:"eventCount"`
+}
 
 func main() {
 	// Parse command line arguments
@@ -21,6 +41,7 @@ func main() {
 		iniData    = flag.String("ini", "./inizh/Data/INI", "Path to CNC INI data directory")
 		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls when events are received")
 		timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
+		testMode   = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
 		help       = flag.Bool("help", false, "Show help information")
 	)
 	flag.Parse()
@@ -66,31 +87,58 @@ func main() {
 	fmt.Printf("Timeout: %v, Poll delay: %v\n", *timeout, *pollDelay)
 	fmt.Println("Waiting for replay file to be written to...")
 
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
 	// Continuous monitoring loop
 	for {
-		// Wait for file to exist and start being written to
-		if !waitForFileActivity(*replayFile) {
-			fmt.Println("File monitoring interrupted. Exiting.")
+		if *testMode {
+			// Test mode: process file immediately
+			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
+			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout)
+			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+			fmt.Println("Test mode complete. Exiting.")
 			return
+		} else {
+			// Production mode: wait for file activity
+			if !waitForFileActivity(*replayFile, sigChan) {
+				fmt.Println("File monitoring interrupted. Exiting.")
+				return
+			}
+
+			fmt.Printf("Replay file activity detected. Starting to monitor events...\n")
+
+			// Process the replay file until completion or timeout
+			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout)
+
+			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+			fmt.Println("Returning to waiting mode for next replay...")
+			fmt.Println()
 		}
-
-		fmt.Printf("Replay file activity detected. Starting to monitor events...\n")
-
-		// Process the replay file until completion or timeout
-		eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout)
-
-		fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
-		fmt.Println("Returning to waiting mode for next replay...")
-		fmt.Println()
 	}
 }
 
 // waitForFileActivity waits for the replay file to exist and start being written to
-func waitForFileActivity(replayFile string) bool {
+func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 	var lastSize int64 = -1
+	var lastModTime time.Time
 	noChangeCount := 0
+	initialWait := true
+	hasSeenActivity := false
+
+	fmt.Println("Waiting for replay file to be actively written to...")
 
 	for {
+		// Check for interrupt signals
+		select {
+		case sig := <-sigChan:
+			fmt.Printf("\nReceived signal %v. Shutting down gracefully...\n", sig)
+			return false
+		default:
+			// Continue with file checking
+		}
+
 		// Check if file exists
 		info, err := os.Stat(replayFile)
 		if err != nil {
@@ -100,22 +148,46 @@ func waitForFileActivity(replayFile string) bool {
 		}
 
 		currentSize := info.Size()
+		currentModTime := info.ModTime()
 
-		// If file size changed, it's being written to
-		if currentSize != lastSize {
+		// If this is the first time we see the file, record its state and wait
+		if initialWait {
 			lastSize = currentSize
+			lastModTime = currentModTime
+			initialWait = false
+			fmt.Printf("File found (size: %d bytes). Waiting to detect write activity...\n", currentSize)
+			time.Sleep(1 * time.Second) // Wait longer to see if it's being written
+			continue
+		}
+
+		// If file size or modification time changed, it's being written to
+		if currentSize != lastSize || !currentModTime.Equal(lastModTime) {
+			hasSeenActivity = true
+			lastSize = currentSize
+			lastModTime = currentModTime
 			noChangeCount = 0
+			fmt.Printf("File activity detected (size: %d bytes). Waiting for stability...\n", currentSize)
 			// Wait a bit more to ensure it's actively being written
 			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 
-		// File size hasn't changed
+		// File size and modification time haven't changed
 		noChangeCount++
 
-		// If file has been stable for a while, it might be ready to read
-		if noChangeCount > 10 { // 1 second of stability
+		// If we've seen activity and file has been stable for a while, it's ready to read
+		if hasSeenActivity && noChangeCount > 10 { // 1 second of stability after activity
+			fmt.Println("File activity stopped. Starting to process...")
 			return true
+		}
+
+		// If we haven't seen any activity for a long time, the file might be static
+		if !hasSeenActivity && noChangeCount > 50 { // 5 seconds of no activity
+			fmt.Println("No file activity detected. This appears to be a static file.")
+			fmt.Println("Use -test flag to process existing files, or wait for a new replay to be written.")
+			fmt.Println("Waiting for file activity... (Press Ctrl+C to exit)")
+			// Reset the counter and continue waiting indefinitely
+			noChangeCount = 0
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -142,6 +214,17 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 		return 0
 	}
 
+	// Capture TimeStampBegin from replay header
+	timeStampBegin := fmt.Sprintf("%d", streamingReplay.Header.TimeStampBegin)
+	fmt.Printf("Replay TimeStampBegin: %s\n", timeStampBegin)
+
+	// Initialize replay session data
+	session := &ReplaySession{
+		TimeStampBegin: timeStampBegin,
+		Events:         make([]EventData, 0),
+		EventCount:     0,
+	}
+
 	// Print header information
 	fmt.Printf("Replay Header:\n")
 	fmt.Printf("  Map: %s\n", streamingReplay.Header.Metadata.MapFile)
@@ -160,11 +243,37 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 		case chunk, ok := <-bodyChan:
 			if !ok {
 				fmt.Printf("\nStreaming completed. Processed %d events.\n", eventCount)
+				// Send session data via API (placeholder)
+				sendSessionData(session)
 				return eventCount
+			}
+
+			// Skip and ignore events with specific OrderIDs
+			if chunk.OrderCode == 1095 || chunk.OrderCode == 1092 || chunk.OrderCode == 1003 {
+				continue
 			}
 
 			eventCount++
 			lastEventTime = time.Now()
+
+			// Poll memory values when a new event is received
+			fmt.Println("  Polling memory values...")
+			vals := memReader.Poll()
+
+			// Create event data for storage
+			eventData := EventData{
+				TimeCode:    uint32(chunk.TimeCode),
+				OrderCode:   uint32(chunk.OrderCode),
+				OrderName:   chunk.OrderName,
+				PlayerID:    uint32(chunk.PlayerID),
+				PlayerName:  chunk.PlayerName,
+				PlayerMoney: vals,
+				Timestamp:   time.Now().Format(time.RFC3339),
+			}
+
+			// Store event data
+			session.Events = append(session.Events, eventData)
+			session.EventCount = eventCount
 
 			// Print event information
 			fmt.Printf("Event %d: Time=%d, Order=%s, PlayerID=%d",
@@ -191,9 +300,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 			fmt.Println()
 
-			// Poll memory values when a new event is received
-			fmt.Println("  Polling memory values...")
-			vals := memReader.Poll()
+			// Display memory values
 			j, _ := json.Marshal(struct {
 				P [8]int32 `json:"p"`
 			}{vals})
@@ -205,6 +312,8 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 			// Check for EndReplay command
 			if chunk.OrderCode == 27 {
 				fmt.Println("EndReplay command detected - streaming will stop.")
+				// Send session data via API (placeholder)
+				sendSessionData(session)
 				return eventCount
 			}
 
@@ -215,9 +324,32 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 			} else {
 				fmt.Printf("\nContext cancelled. Processed %d events before timeout.\n", eventCount)
 			}
+			// Send session data via API (placeholder)
+			sendSessionData(session)
 			return eventCount
 		}
 	}
+}
+
+// sendSessionData sends the complete replay session data via API (placeholder)
+func sendSessionData(session *ReplaySession) {
+	fmt.Printf("\n=== SENDING SESSION DATA VIA API (PLACEHOLDER) ===\n")
+	fmt.Printf("TimeStampBegin: %s\n", session.TimeStampBegin)
+	fmt.Printf("Total Events: %d\n", session.EventCount)
+
+	// Convert session to JSON for display
+	sessionJSON, err := json.MarshalIndent(session, "", "  ")
+	if err != nil {
+		fmt.Printf("Error marshaling session data: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Session Data (JSON):\n%s\n", string(sessionJSON))
+	fmt.Printf("=== END API PLACEHOLDER ===\n\n")
+
+	// TODO: Implement actual API call here
+	// This is where you would make an HTTP POST request to your API endpoint
+	// with the session data for storage and later pairing with replay data
 }
 
 func showHelp() {
@@ -235,6 +367,8 @@ func showHelp() {
 	fmt.Println("        Delay between memory polls when events are received (default: 100ms)")
 	fmt.Println("  -timeout duration")
 	fmt.Println("        Timeout for file inactivity before returning to waiting mode (default: 2m)")
+	fmt.Println("  -test")
+	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()
