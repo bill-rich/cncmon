@@ -196,18 +196,20 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 
 // processReplayFile processes a replay file until completion or timeout
 func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStore *iniparse.ObjectStore, powerStore *iniparse.PowerStore, upgradeStore *iniparse.UpgradeStore, pollDelay time.Duration, timeout time.Duration) int {
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	// Create context with a much longer timeout to allow for real-time streaming
+	// The cncstats library will handle the actual timeout for new data
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// Configure streaming options
+	// Configure streaming options for better real-time monitoring
 	options := &zhreplay.StreamReplayOptions{
-		PollInterval: 100 * time.Millisecond,
-		MaxWaitTime:  30 * time.Second,
+		PollInterval: 50 * time.Millisecond, // Check more frequently for new data
+		MaxWaitTime:  2 * time.Minute,       // Wait up to 2 minutes for new data
 		BufferSize:   100,
 	}
 
 	// Start streaming replay events
+	fmt.Println("Starting replay streaming with real-time monitoring...")
 	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, objectStore, powerStore, upgradeStore, options)
 	if err != nil {
 		fmt.Printf("Failed to start streaming: %v\n", err)
@@ -242,7 +244,11 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 		select {
 		case chunk, ok := <-bodyChan:
 			if !ok {
-				fmt.Printf("\nStreaming completed. Processed %d events.\n", eventCount)
+				fmt.Printf("\nStreaming completed (channel closed). Processed %d events.\n", eventCount)
+				fmt.Println("This could mean:")
+				fmt.Println("  - EndReplay command was received")
+				fmt.Println("  - File reached end and no new data for 2 minutes")
+				fmt.Println("  - Context was cancelled")
 				// Send session data via API (placeholder)
 				sendSessionData(session)
 				return eventCount
