@@ -31,9 +31,9 @@ type EventData struct {
 
 // ReplaySession stores complete replay session data
 type ReplaySession struct {
-	TimeStampBegin int64       `json:"timeStampBegin"`
-	Events         []EventData `json:"events"`
-	EventCount     int         `json:"eventCount"`
+	Seed       int64       `json:"seed"`
+	Events     []EventData `json:"events"`
+	EventCount int         `json:"eventCount"`
 }
 
 func main() {
@@ -220,15 +220,15 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 		return 0
 	}
 
-	// Capture TimeStampBegin from replay header
-	timeStampBegin := streamingReplay.Header.TimeStampBegin
-	fmt.Printf("Replay TimeStampBegin: %d\n", timeStampBegin)
+	// Capture Seed from replay header
+	seed := streamingReplay.Header.Seed
+	fmt.Printf("Replay Seed: %d\n", seed)
 
 	// Initialize replay session data
 	session := &ReplaySession{
-		TimeStampBegin: timeStampBegin,
-		Events:         make([]EventData, 0),
-		EventCount:     0,
+		Seed:       seed,
+		Events:     make([]EventData, 0),
+		EventCount: 0,
 	}
 
 	// Print header information
@@ -272,7 +272,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 			// Send money data via API immediately
 			fmt.Println("  Sending money data via API...")
-			err := sendMoneyData(apiURL, session.TimeStampBegin, uint32(chunk.TimeCode), vals)
+			err := sendMoneyData(apiURL, session.Seed, uint32(chunk.TimeCode), vals)
 			if err != nil {
 				fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
 			} else {
@@ -352,32 +352,32 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 // MoneyDataRequest represents the API request for player money data
 type MoneyDataRequest struct {
-	TimestampBegin int64 `json:"timestamp_begin"`
-	Timecode       int64 `json:"timecode"`
-	Player1Money   int64 `json:"player_1_money"`
-	Player2Money   int64 `json:"player_2_money"`
-	Player3Money   int64 `json:"player_3_money"`
-	Player4Money   int64 `json:"player_4_money"`
-	Player5Money   int64 `json:"player_5_money"`
-	Player6Money   int64 `json:"player_6_money"`
-	Player7Money   int64 `json:"player_7_money"`
-	Player8Money   int64 `json:"player_8_money"`
+	Seed         int64 `json:"seed"`
+	Timecode     int64 `json:"timecode"`
+	Player1Money int64 `json:"player_1_money"`
+	Player2Money int64 `json:"player_2_money"`
+	Player3Money int64 `json:"player_3_money"`
+	Player4Money int64 `json:"player_4_money"`
+	Player5Money int64 `json:"player_5_money"`
+	Player6Money int64 `json:"player_6_money"`
+	Player7Money int64 `json:"player_7_money"`
+	Player8Money int64 `json:"player_8_money"`
 }
 
 // sendMoneyData sends player money data to the API endpoint
-func sendMoneyData(apiURL string, timeStampBegin int64, timeCode uint32, playerMoney [8]int32) error {
+func sendMoneyData(apiURL string, seed int64, timeCode uint32, playerMoney [8]int32) error {
 	// Create the request payload
 	request := MoneyDataRequest{
-		TimestampBegin: timeStampBegin,
-		Timecode:       int64(timeCode),
-		Player1Money:   int64(playerMoney[0]),
-		Player2Money:   int64(playerMoney[1]),
-		Player3Money:   int64(playerMoney[2]),
-		Player4Money:   int64(playerMoney[3]),
-		Player5Money:   int64(playerMoney[4]),
-		Player6Money:   int64(playerMoney[5]),
-		Player7Money:   int64(playerMoney[6]),
-		Player8Money:   int64(playerMoney[7]),
+		Seed:         seed,
+		Timecode:     int64(timeCode),
+		Player1Money: int64(playerMoney[0]),
+		Player2Money: int64(playerMoney[1]),
+		Player3Money: int64(playerMoney[2]),
+		Player4Money: int64(playerMoney[3]),
+		Player5Money: int64(playerMoney[4]),
+		Player6Money: int64(playerMoney[5]),
+		Player7Money: int64(playerMoney[6]),
+		Player8Money: int64(playerMoney[7]),
 	}
 
 	// Marshal to JSON
@@ -413,7 +413,7 @@ func sendMoneyData(apiURL string, timeStampBegin int64, timeCode uint32, playerM
 // sendSessionData sends the complete replay session data via API (placeholder)
 func sendSessionData(session *ReplaySession) {
 	fmt.Printf("\n=== SENDING SESSION DATA VIA API (PLACEHOLDER) ===\n")
-	fmt.Printf("TimeStampBegin: %d\n", session.TimeStampBegin)
+	fmt.Printf("Seed: %d\n", session.Seed)
 	fmt.Printf("Total Events: %d\n", session.EventCount)
 
 	// Convert session to JSON for display
