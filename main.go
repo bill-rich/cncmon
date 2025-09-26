@@ -31,7 +31,7 @@ type EventData struct {
 
 // ReplaySession stores complete replay session data
 type ReplaySession struct {
-	TimeStampBegin string      `json:"timeStampBegin"`
+	TimeStampBegin int64       `json:"timeStampBegin"`
 	Events         []EventData `json:"events"`
 	EventCount     int         `json:"eventCount"`
 }
@@ -221,8 +221,8 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 	}
 
 	// Capture TimeStampBegin from replay header
-	timeStampBegin := fmt.Sprintf("%d", streamingReplay.Header.TimeStampBegin)
-	fmt.Printf("Replay TimeStampBegin: %s\n", timeStampBegin)
+	timeStampBegin := streamingReplay.Header.TimeStampBegin
+	fmt.Printf("Replay TimeStampBegin: %d\n", timeStampBegin)
 
 	// Initialize replay session data
 	session := &ReplaySession{
@@ -352,30 +352,23 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 // MoneyDataRequest represents the API request for player money data
 type MoneyDataRequest struct {
-	TimestampBegin time.Time `json:"timestamp_begin"`
-	Timecode       int64     `json:"timecode"`
-	Player1Money   int64     `json:"player_1_money"`
-	Player2Money   int64     `json:"player_2_money"`
-	Player3Money   int64     `json:"player_3_money"`
-	Player4Money   int64     `json:"player_4_money"`
-	Player5Money   int64     `json:"player_5_money"`
-	Player6Money   int64     `json:"player_6_money"`
-	Player7Money   int64     `json:"player_7_money"`
-	Player8Money   int64     `json:"player_8_money"`
+	TimestampBegin int64 `json:"timestamp_begin"`
+	Timecode       int64 `json:"timecode"`
+	Player1Money   int64 `json:"player_1_money"`
+	Player2Money   int64 `json:"player_2_money"`
+	Player3Money   int64 `json:"player_3_money"`
+	Player4Money   int64 `json:"player_4_money"`
+	Player5Money   int64 `json:"player_5_money"`
+	Player6Money   int64 `json:"player_6_money"`
+	Player7Money   int64 `json:"player_7_money"`
+	Player8Money   int64 `json:"player_8_money"`
 }
 
 // sendMoneyData sends player money data to the API endpoint
-func sendMoneyData(apiURL string, timeStampBegin string, timeCode uint32, playerMoney [8]int32) error {
-	// Parse the timestamp begin string to time.Time
-	timestampBegin, err := time.Parse(time.RFC3339, timeStampBegin)
-	if err != nil {
-		// If parsing fails, use current time
-		timestampBegin = time.Now()
-	}
-
+func sendMoneyData(apiURL string, timeStampBegin int64, timeCode uint32, playerMoney [8]int32) error {
 	// Create the request payload
 	request := MoneyDataRequest{
-		TimestampBegin: timestampBegin,
+		TimestampBegin: timeStampBegin,
 		Timecode:       int64(timeCode),
 		Player1Money:   int64(playerMoney[0]),
 		Player2Money:   int64(playerMoney[1]),
@@ -420,7 +413,7 @@ func sendMoneyData(apiURL string, timeStampBegin string, timeCode uint32, player
 // sendSessionData sends the complete replay session data via API (placeholder)
 func sendSessionData(session *ReplaySession) {
 	fmt.Printf("\n=== SENDING SESSION DATA VIA API (PLACEHOLDER) ===\n")
-	fmt.Printf("TimeStampBegin: %s\n", session.TimeStampBegin)
+	fmt.Printf("TimeStampBegin: %d\n", session.TimeStampBegin)
 	fmt.Printf("Total Events: %d\n", session.EventCount)
 
 	// Convert session to JSON for display
