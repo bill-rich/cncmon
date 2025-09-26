@@ -203,9 +203,10 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 	// Configure streaming options for better real-time monitoring
 	options := &zhreplay.StreamReplayOptions{
-		PollInterval: 50 * time.Millisecond, // Check more frequently for new data
-		MaxWaitTime:  2 * time.Minute,       // Wait up to 2 minutes for new data
-		BufferSize:   100,
+		PollInterval:      50 * time.Millisecond, // Check more frequently for new data
+		MaxWaitTime:       30 * time.Second,      // Max wait for individual operations
+		InactivityTimeout: timeout,               // Use our timeout for inactivity (2 minutes default)
+		BufferSize:        100,
 	}
 
 	// Start streaming replay events
