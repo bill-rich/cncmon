@@ -69,17 +69,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize memory reader
-	memReader, err := zhreader.Init()
-	if err != nil {
-		fmt.Printf("Failed to initialize memory reader: %v\n", err)
-		return
-	}
-	defer memReader.Close()
-
 	fmt.Printf("Starting continuous monitoring of replay file: %s\n", *replayFile)
 	fmt.Printf("Timeout: %v, Poll delay: %v\n", *timeout, *pollDelay)
-	fmt.Println("Waiting for replay file to be written to...")
+	fmt.Println("Waiting for generals.exe process and replay file...")
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
@@ -87,16 +79,25 @@ func main() {
 
 	// Continuous monitoring loop
 	for {
+		// Wait for generals.exe process to be available
+		memReader, err := waitForGeneralsProcess(sigChan)
+		if err != nil {
+			fmt.Printf("Process monitoring interrupted: %v\n", err)
+			return
+		}
+
 		if *testMode {
 			// Test mode: process file immediately
 			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
 			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL)
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+			memReader.Close()
 			fmt.Println("Test mode complete. Exiting.")
 			return
 		} else {
 			// Production mode: wait for file activity
 			if !waitForFileActivity(*replayFile, sigChan) {
+				memReader.Close()
 				fmt.Println("File monitoring interrupted. Exiting.")
 				return
 			}
@@ -107,9 +108,35 @@ func main() {
 			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL)
 
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+			memReader.Close()
 			fmt.Println("Returning to waiting mode for next replay...")
 			fmt.Println()
 		}
+	}
+}
+
+// waitForGeneralsProcess waits for the generals.exe process to be available
+func waitForGeneralsProcess(sigChan <-chan os.Signal) (*zhreader.Reader, error) {
+	fmt.Println("Waiting for generals.exe process...")
+
+	for {
+		// Check for interrupt signals
+		select {
+		case sig := <-sigChan:
+			return nil, fmt.Errorf("received signal %v", sig)
+		default:
+			// Continue with process checking
+		}
+
+		// Try to initialize memory reader
+		memReader, err := zhreader.Init()
+		if err == nil {
+			fmt.Println("Generals.exe process found and memory reader initialized successfully")
+			return memReader, nil
+		}
+
+		// Process not found, wait a bit before trying again
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -263,6 +290,20 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 			// Poll memory values when a new event is received
 			fmt.Println("  Polling memory values...")
 			vals := memReader.Poll()
+
+			// Check if all values are -1, which indicates the process may have gone away
+			allInvalid := true
+			for _, val := range vals {
+				if val != -1 {
+					allInvalid = false
+					break
+				}
+			}
+			if allInvalid {
+				fmt.Println("  Warning: All memory values are invalid. Generals.exe process may have gone away.")
+				fmt.Println("  Returning to process monitoring...")
+				return eventCount
+			}
 
 			// Send money data via API immediately
 			fmt.Println("  Sending money data via API...")
