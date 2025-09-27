@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,7 +14,6 @@ import (
 	"time"
 
 	zhreader "github.com/bill-rich/cncmon/pkg/memmon"
-	"github.com/bill-rich/cncstats/pkg/iniparse"
 	"github.com/bill-rich/cncstats/pkg/zhreplay"
 )
 
@@ -50,7 +48,6 @@ func main() {
 	// Parse command line arguments
 	var (
 		replayFile = flag.String("file", defaultReplayFile, "Replay file to monitor")
-		iniData    = flag.String("ini", "./inizh/Data/INI", "Path to CNC INI data directory")
 		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls when events are received")
 		timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
 		apiURL     = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
@@ -80,22 +77,6 @@ func main() {
 	}
 	defer memReader.Close()
 
-	// Initialize cncstats stores
-	objectStore, err := iniparse.NewObjectStore(*iniData)
-	if err != nil {
-		log.Fatalf("Could not load object store: %v", err)
-	}
-
-	powerStore, err := iniparse.NewPowerStore(*iniData)
-	if err != nil {
-		log.Fatalf("Could not load power store: %v", err)
-	}
-
-	upgradeStore, err := iniparse.NewUpgradeStore(*iniData)
-	if err != nil {
-		log.Fatalf("Could not load upgrade store: %v", err)
-	}
-
 	fmt.Printf("Starting continuous monitoring of replay file: %s\n", *replayFile)
 	fmt.Printf("Timeout: %v, Poll delay: %v\n", *timeout, *pollDelay)
 	fmt.Println("Waiting for replay file to be written to...")
@@ -109,7 +90,7 @@ func main() {
 		if *testMode {
 			// Test mode: process file immediately
 			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
-			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout, *apiURL)
+			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL)
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
 			fmt.Println("Test mode complete. Exiting.")
 			return
@@ -123,7 +104,7 @@ func main() {
 			fmt.Printf("Replay file activity detected. Starting to monitor events...\n")
 
 			// Process the replay file until completion or timeout
-			eventCount := processReplayFile(*replayFile, memReader, objectStore, powerStore, upgradeStore, *pollDelay, *timeout, *apiURL)
+			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL)
 
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
 			fmt.Println("Returning to waiting mode for next replay...")
@@ -208,7 +189,7 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 }
 
 // processReplayFile processes a replay file until completion or timeout
-func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStore *iniparse.ObjectStore, powerStore *iniparse.PowerStore, upgradeStore *iniparse.UpgradeStore, pollDelay time.Duration, timeout time.Duration, apiURL string) int {
+func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string) int {
 	// Create context with a much longer timeout to allow for real-time streaming
 	// The cncstats library will handle the actual timeout for new data
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -227,7 +208,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 	// Start streaming replay events
 	fmt.Println("Starting replay streaming with real-time monitoring...")
-	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, objectStore, powerStore, upgradeStore, options)
+	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
 	if err != nil {
 		fmt.Printf("Failed to start streaming: %v\n", err)
 		return 0
@@ -453,8 +434,6 @@ func showHelp() {
 	fmt.Println("Flags:")
 	fmt.Println("  -file string")
 	fmt.Println("        Replay file to monitor (required)")
-	fmt.Println("  -ini string")
-	fmt.Println("        Path to CNC INI data directory (default: ./inizh/Data/INI)")
 	fmt.Println("  -delay duration")
 	fmt.Println("        Delay between memory polls when events are received (default: 100ms)")
 	fmt.Println("  -timeout duration")
