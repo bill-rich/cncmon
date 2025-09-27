@@ -3,11 +3,11 @@ module github.com/bill-rich/cncmon
 go 1.24.3
 
 require (
-	github.com/bill-rich/cncstats v0.0.0-20250926193733-c43b7007115f
+	github.com/bill-rich/cncstats v0.0.0-20250927010600-86f04ede1031
 	golang.org/x/sys v0.36.0
 )
 
-replace github.com/bill-rich/cncstats => /Users/hrich/go/src/github.com/bill-rich/cncstats
+replace github.com/bill-rich/cncstats => /home/hrich/go/src/github.com/bill-rich/cncstats
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
