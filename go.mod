@@ -7,7 +7,7 @@ require (
 	golang.org/x/sys v0.36.0
 )
 
-replace github.com/bill-rich/cncstats => /Users/hrich/go/src/github.com/bill-rich/cncstats
+replace github.com/bill-rich/cncstats => /home/hrich/go/src/github.com/bill-rich/cncstats
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect

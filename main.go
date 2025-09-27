@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -31,19 +32,28 @@ type EventData struct {
 
 // ReplaySession stores complete replay session data
 type ReplaySession struct {
-	Seed       int64       `json:"seed"`
+	Seed       string      `json:"seed"`
 	Events     []EventData `json:"events"`
 	EventCount int         `json:"eventCount"`
 }
 
 func main() {
+	// Get user's home directory for default replay file path
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		homeDir = "C:\\Users\\User" // Fallback for Windows
+	}
+
+	// Default replay file path for Windows
+	defaultReplayFile := filepath.Join(homeDir, "Documents", "Command and Conquer Generals Zero Hour Data", "Replays", "00000000.rep")
+
 	// Parse command line arguments
 	var (
-		replayFile = flag.String("file", "", "Replay file to monitor (required)")
+		replayFile = flag.String("file", defaultReplayFile, "Replay file to monitor")
 		iniData    = flag.String("ini", "./inizh/Data/INI", "Path to CNC INI data directory")
 		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls when events are received")
 		timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
-		apiURL     = flag.String("api", "http://localhost:8080", "API endpoint URL for sending money data")
+		apiURL     = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
 		testMode   = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
 		help       = flag.Bool("help", false, "Show help information")
 	)
@@ -171,7 +181,7 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 			noChangeCount = 0
 			fmt.Printf("File activity detected (size: %d bytes). Waiting for stability...\n", currentSize)
 			// Wait a bit more to ensure it's actively being written
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
@@ -212,6 +222,9 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 		BufferSize:        100,
 	}
 
+	// Give it some time to write the seed
+	time.Sleep(5 * time.Second)
+
 	// Start streaming replay events
 	fmt.Println("Starting replay streaming with real-time monitoring...")
 	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, objectStore, powerStore, upgradeStore, options)
@@ -221,8 +234,8 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 	}
 
 	// Capture Seed from replay header
-	seed := streamingReplay.Header.Seed
-	fmt.Printf("Replay Seed: %d\n", seed)
+	seed := streamingReplay.Header.Metadata.Seed
+	fmt.Printf("Replay Seed: %s\n", seed)
 
 	// Initialize replay session data
 	session := &ReplaySession{
@@ -352,20 +365,20 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, objectStor
 
 // MoneyDataRequest represents the API request for player money data
 type MoneyDataRequest struct {
-	Seed         int64 `json:"seed"`
-	Timecode     int64 `json:"timecode"`
-	Player1Money int64 `json:"player_1_money"`
-	Player2Money int64 `json:"player_2_money"`
-	Player3Money int64 `json:"player_3_money"`
-	Player4Money int64 `json:"player_4_money"`
-	Player5Money int64 `json:"player_5_money"`
-	Player6Money int64 `json:"player_6_money"`
-	Player7Money int64 `json:"player_7_money"`
-	Player8Money int64 `json:"player_8_money"`
+	Seed         string `json:"seed"`
+	Timecode     int64  `json:"timecode"`
+	Player1Money int64  `json:"player_1_money"`
+	Player2Money int64  `json:"player_2_money"`
+	Player3Money int64  `json:"player_3_money"`
+	Player4Money int64  `json:"player_4_money"`
+	Player5Money int64  `json:"player_5_money"`
+	Player6Money int64  `json:"player_6_money"`
+	Player7Money int64  `json:"player_7_money"`
+	Player8Money int64  `json:"player_8_money"`
 }
 
 // sendMoneyData sends player money data to the API endpoint
-func sendMoneyData(apiURL string, seed int64, timeCode uint32, playerMoney [8]int32) error {
+func sendMoneyData(apiURL string, seed string, timeCode uint32, playerMoney [8]int32) error {
 	// Create the request payload
 	request := MoneyDataRequest{
 		Seed:         seed,
@@ -413,7 +426,7 @@ func sendMoneyData(apiURL string, seed int64, timeCode uint32, playerMoney [8]in
 // sendSessionData sends the complete replay session data via API (placeholder)
 func sendSessionData(session *ReplaySession) {
 	fmt.Printf("\n=== SENDING SESSION DATA VIA API (PLACEHOLDER) ===\n")
-	fmt.Printf("Seed: %d\n", session.Seed)
+	fmt.Printf("Seed: %s\n", session.Seed)
 	fmt.Printf("Total Events: %d\n", session.EventCount)
 
 	// Convert session to JSON for display
