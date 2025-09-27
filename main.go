@@ -268,8 +268,8 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 	eventCount := 0
 	lastEventTime := time.Now()
 
-	// Start 50ms polling timer
-	pollTicker := time.NewTicker(50 * time.Millisecond)
+	// Start 500ms polling timer
+	pollTicker := time.NewTicker(500 * time.Millisecond)
 	defer pollTicker.Stop()
 
 	for {
