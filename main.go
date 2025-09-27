@@ -48,7 +48,7 @@ func main() {
 	// Parse command line arguments
 	var (
 		replayFile = flag.String("file", defaultReplayFile, "Replay file to monitor")
-		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls when events are received")
+		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
 		timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
 		apiURL     = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
 		testMode   = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
@@ -261,9 +261,16 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 	}
 	fmt.Println()
 
-	// Process body events and poll memory
+	// Initialize polling state
+	var lastMoneyValues [8]int32
+	var lastTimeCode uint32
+	var timeCodeIncrement uint32
 	eventCount := 0
 	lastEventTime := time.Now()
+
+	// Start 50ms polling timer
+	pollTicker := time.NewTicker(50 * time.Millisecond)
+	defer pollTicker.Stop()
 
 	for {
 		select {
@@ -274,21 +281,30 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 				fmt.Println("  - EndReplay command was received")
 				fmt.Println("  - File reached end and no new data for 2 minutes")
 				fmt.Println("  - Context was cancelled")
-				// Send session data via API (placeholder)
-				sendSessionData(session)
 				return eventCount
 			}
 
-			// Skip and ignore events with specific OrderIDs
-			if chunk.OrderCode == 1095 || chunk.OrderCode == 1092 || chunk.OrderCode == 1003 {
-				continue
+			// Update last seen timecode from replay events (no filtering)
+			lastTimeCode = uint32(chunk.TimeCode)
+			timeCodeIncrement = 0 // Reset increment when we get a new replay event
+			lastEventTime = time.Now()
+			eventCount++
+
+			// Print replay event information (for debugging)
+			fmt.Printf("Replay Event: Time=%d, Order=%s, PlayerID=%d", chunk.TimeCode, chunk.OrderName, chunk.PlayerID)
+			if chunk.PlayerName != "" {
+				fmt.Printf(", Player=%s", chunk.PlayerName)
+			}
+			fmt.Println()
+
+			// Check for EndReplay command
+			if chunk.OrderCode == 27 {
+				fmt.Println("EndReplay command detected - streaming will stop.")
+				return eventCount
 			}
 
-			eventCount++
-			lastEventTime = time.Now()
-
-			// Poll memory values when a new event is received
-			fmt.Println("  Polling memory values...")
+		case <-pollTicker.C:
+			// Poll memory every 50ms
 			vals := memReader.Poll()
 
 			// Check if all values are -1, which indicates the process may have gone away
@@ -305,70 +321,40 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 				return eventCount
 			}
 
-			// Send money data via API immediately
-			fmt.Println("  Sending money data via API...")
-			err := sendMoneyData(apiURL, session.Seed, uint32(chunk.TimeCode), vals)
-			if err != nil {
-				fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
-			} else {
-				fmt.Println("  Money data sent successfully")
-			}
-
-			// Create event data for storage (optional - for debugging)
-			eventData := EventData{
-				TimeCode:    uint32(chunk.TimeCode),
-				OrderCode:   uint32(chunk.OrderCode),
-				OrderName:   chunk.OrderName,
-				PlayerID:    uint32(chunk.PlayerID),
-				PlayerName:  chunk.PlayerName,
-				PlayerMoney: vals,
-				Timestamp:   time.Now().Format(time.RFC3339),
-			}
-
-			// Store event data (for debugging/session summary)
-			session.Events = append(session.Events, eventData)
-			session.EventCount = eventCount
-
-			// Print event information
-			fmt.Printf("Event %d: Time=%d, Order=%s, PlayerID=%d",
-				eventCount, chunk.TimeCode, chunk.OrderName, chunk.PlayerID)
-
-			// Add player name if available
-			if chunk.PlayerName != "" {
-				fmt.Printf(", Player=%s", chunk.PlayerName)
-			}
-
-			// Add details for specific order types
-			if chunk.Details != nil {
-				switch chunk.OrderCode {
-				case 1047: // CreateUnit
-					fmt.Printf(", Unit=%s (Cost=%d)", chunk.Details.GetName(), chunk.Details.GetCost())
-				case 1049: // BuildObject
-					fmt.Printf(", Building=%s (Cost=%d)", chunk.Details.GetName(), chunk.Details.GetCost())
-				case 1045: // BuildUpgrade
-					fmt.Printf(", Upgrade=%s (Cost=%d)", chunk.Details.GetName(), chunk.Details.GetCost())
-				case 1040, 1041, 1042: // SpecialPower variants
-					fmt.Printf(", Power=%s", chunk.Details.GetName())
+			// Check if money values have changed
+			moneyChanged := false
+			for i, val := range vals {
+				if val != lastMoneyValues[i] {
+					moneyChanged = true
+					break
 				}
 			}
 
-			fmt.Println()
+			if moneyChanged {
+				// Increment timecode if this is a subsequent change between replay events
+				if timeCodeIncrement > 0 {
+					timeCodeIncrement++
+				} else {
+					timeCodeIncrement = 1
+				}
 
-			// Display memory values
-			j, _ := json.Marshal(struct {
-				P [8]int32 `json:"p"`
-			}{vals})
-			fmt.Printf("  Memory values: %s\n", string(j))
+				// Send money data via API with incremented timecode
+				fmt.Printf("  Money changed - sending data (timecode: %d + %d)...\n", lastTimeCode, timeCodeIncrement)
+				err := sendMoneyData(apiURL, session.Seed, lastTimeCode+timeCodeIncrement, vals)
+				if err != nil {
+					fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
+				} else {
+					fmt.Println("  Money data sent successfully")
+				}
 
-			// Add a small delay to avoid overwhelming the system
-			time.Sleep(pollDelay)
+				// Display memory values
+				j, _ := json.Marshal(struct {
+					P [8]int32 `json:"p"`
+				}{vals})
+				fmt.Printf("  Memory values: %s\n", string(j))
 
-			// Check for EndReplay command
-			if chunk.OrderCode == 27 {
-				fmt.Println("EndReplay command detected - streaming will stop.")
-				// Send session data via API (placeholder)
-				sendSessionData(session)
-				return eventCount
+				// Update last known values
+				lastMoneyValues = vals
 			}
 
 		case <-ctx.Done():
@@ -378,8 +364,6 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 			} else {
 				fmt.Printf("\nContext cancelled. Processed %d events before timeout.\n", eventCount)
 			}
-			// Send session data via API (placeholder)
-			sendSessionData(session)
 			return eventCount
 		}
 	}
@@ -445,27 +429,6 @@ func sendMoneyData(apiURL string, seed string, timeCode uint32, playerMoney [8]i
 	return nil
 }
 
-// sendSessionData sends the complete replay session data via API (placeholder)
-func sendSessionData(session *ReplaySession) {
-	fmt.Printf("\n=== SENDING SESSION DATA VIA API (PLACEHOLDER) ===\n")
-	fmt.Printf("Seed: %s\n", session.Seed)
-	fmt.Printf("Total Events: %d\n", session.EventCount)
-
-	// Convert session to JSON for display
-	sessionJSON, err := json.MarshalIndent(session, "", "  ")
-	if err != nil {
-		fmt.Printf("Error marshaling session data: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Session Data (JSON):\n%s\n", string(sessionJSON))
-	fmt.Printf("=== END API PLACEHOLDER ===\n\n")
-
-	// TODO: Implement actual API call here
-	// This is where you would make an HTTP POST request to your API endpoint
-	// with the session data for storage and later pairing with replay data
-}
-
 func showHelp() {
 	fmt.Println("CNC Monitor - Command and Conquer Replay Monitor with Memory Polling")
 	fmt.Println()
@@ -476,18 +439,21 @@ func showHelp() {
 	fmt.Println("  -file string")
 	fmt.Println("        Replay file to monitor (required)")
 	fmt.Println("  -delay duration")
-	fmt.Println("        Delay between memory polls when events are received (default: 100ms)")
+	fmt.Println("        Delay between memory polls (unused - now polls every 50ms)")
 	fmt.Println("  -timeout duration")
 	fmt.Println("        Timeout for file inactivity before returning to waiting mode (default: 2m)")
 	fmt.Println("  -api string")
-	fmt.Println("        API endpoint URL for sending money data (default: http://localhost:8080)")
+	fmt.Println("        API endpoint URL for sending money data (default: https://cncstats.herokuapp.com)")
 	fmt.Println("  -test")
 	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()
 	fmt.Println("This tool continuously monitors a Command and Conquer replay file and polls memory values")
-	fmt.Println("from the running generals.exe process whenever new events are detected in the replay.")
+	fmt.Println("from the running generals.exe process every 50ms. When money values change, it sends")
+	fmt.Println("events to the API using the last seen timecode from replay events. Multiple money changes")
+	fmt.Println("between replay events increment the timecode. Replay events are still used to detect")
+	fmt.Println("the end of the replay.")
 	fmt.Println("It waits for the file to be written to, processes it until completion or timeout,")
 	fmt.Println("then returns to waiting mode for the next replay.")
 }
