@@ -119,7 +119,7 @@ func (r *Reader) Poll() [8]int32 {
 		r.initialFound = true
 	}
 
-	playerOffsets := [8]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38}
+	playerOffsets := [9]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C}
 
 	// root = *(base + initial)
 	// log.Printf("AOB Poll: Using cached initial address 0x%X (offset: 0x%X)", r.initialAddr, r.initialAddr-r.base)
@@ -131,16 +131,44 @@ func (r *Reader) Poll() [8]int32 {
 	}
 	// log.Printf("AOB Poll: Root pointer value: 0x%X", root)
 
-	for i := 0; i < 8; i++ {
+	// Read all 9 values first
+	var tempValues [9]int32
+	for i := 0; i < 9; i++ {
 		mid, ok := r.rpmU32(uintptr(root) + uintptr(playerOffsets[i]))
 		if !ok {
+			tempValues[i] = -1
 			continue
 		}
 		val, ok := r.rpmI32(uintptr(mid) + 0x38)
 		if !ok {
+			tempValues[i] = -1
 			continue
 		}
-		out[i] = val
+		tempValues[i] = val
+	}
+
+	// Find the last positive value and replace it and following zeros with -1
+	lastPositiveIndex := -1
+	for i := 0; i < 9; i++ {
+		if tempValues[i] > 0 {
+			lastPositiveIndex = i
+		}
+	}
+
+	// Replace the last positive value and any following zeros with -1
+	if lastPositiveIndex >= 0 {
+		for i := lastPositiveIndex; i < 9; i++ {
+			if tempValues[i] == 0 {
+				tempValues[i] = -1
+			}
+		}
+		// Also replace the last positive value itself
+		tempValues[lastPositiveIndex] = -1
+	}
+
+	// Copy the first 8 values to the output array
+	for i := 0; i < 8; i++ {
+		out[i] = tempValues[i]
 	}
 	return out
 }
