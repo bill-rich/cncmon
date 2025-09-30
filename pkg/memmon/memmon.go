@@ -4,6 +4,8 @@ package memmon
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -61,8 +63,10 @@ type MODULEENTRY32 struct {
 }
 
 type Reader struct {
-	hProc windows.Handle
-	base  uintptr // generals.exe base
+	hProc        windows.Handle
+	base         uintptr // generals.exe base
+	initialAddr  uintptr // cached initial address found via AOB
+	initialFound bool    // whether initial address has been found
 }
 
 // Init attaches to generals.exe and caches process handle + module base.
@@ -100,14 +104,32 @@ func (r *Reader) Poll() [8]int32 {
 		return out
 	}
 
-	const initial = uintptr(0x0062BAA0)
-	playerOffsets := [8]uint32{0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28}
+	// Find initial address using AOB search if not already found
+	if !r.initialFound {
+		log.Printf("AOB Search: Starting pattern search for initial address...")
+		initialAddr, err := r.findInitialAddress()
+		if err != nil {
+			log.Printf("AOB Search: Pattern search failed (%v), falling back to hardcoded address 0x%X", err, 0x0062BAA0)
+			// If AOB search fails, fall back to hardcoded address as backup
+			initialAddr = uintptr(0x0062BAA0)
+		} else {
+			log.Printf("AOB Search: Pattern found at address 0x%X (offset from base: 0x%X)", initialAddr, initialAddr-r.base)
+		}
+		r.initialAddr = initialAddr
+		r.initialFound = true
+	}
+
+	playerOffsets := [8]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38}
 
 	// root = *(base + initial)
-	root, ok := r.rpmU32(r.base + initial)
+	// log.Printf("AOB Poll: Using cached initial address 0x%X (offset: 0x%X)", r.initialAddr, r.initialAddr-r.base)
+	// root, ok := r.rpmU32(r.base + r.initialAddr)
+	root, ok := r.rpmU32(r.initialAddr)
 	if !ok {
+		log.Printf("AOB Poll: Failed to read root pointer at 0x%X", r.base+r.initialAddr)
 		return out
 	}
+	// log.Printf("AOB Poll: Root pointer value: 0x%X", root)
 
 	for i := 0; i < 8; i++ {
 		mid, ok := r.rpmU32(uintptr(root) + uintptr(playerOffsets[i]))
@@ -222,4 +244,149 @@ func (r *Reader) rpmI32(addr uintptr) (int32, bool) {
 		return 0, false
 	}
 	return *(*int32)(unsafe.Pointer(&b[0])), true
+}
+
+// ParseAOBPattern parses an AOB pattern string and returns byte array with wildcards
+func ParseAOBPattern(pattern string) ([]byte, []bool, error) {
+	log.Printf("AOB Parse: Parsing pattern '%s'", pattern)
+
+	// Remove spaces and convert to lowercase
+	pattern = strings.ReplaceAll(strings.ToLower(pattern), " ", "")
+
+	if len(pattern)%2 != 0 {
+		return nil, nil, errors.New("pattern length must be even")
+	}
+
+	bytes := make([]byte, len(pattern)/2)
+	wildcards := make([]bool, len(pattern)/2)
+	wildcardCount := 0
+
+	for i := 0; i < len(pattern); i += 2 {
+		hexStr := pattern[i : i+2]
+		if hexStr == "??" {
+			bytes[i/2] = 0
+			wildcards[i/2] = true
+			wildcardCount++
+		} else {
+			var b byte
+			_, err := fmt.Sscanf(hexStr, "%02x", &b)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid hex byte: %s", hexStr)
+			}
+			bytes[i/2] = b
+			wildcards[i/2] = false
+		}
+	}
+
+	log.Printf("AOB Parse: Parsed %d bytes with %d wildcards", len(bytes), wildcardCount)
+	return bytes, wildcards, nil
+}
+
+// searchAOBPattern searches for the AOB pattern in process memory
+func (r *Reader) searchAOBPattern(pattern string) (uintptr, error) {
+	patternBytes, wildcards, err := ParseAOBPattern(pattern)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse pattern: %w", err)
+	}
+
+	// Get module information to determine search range
+	pid, err := findProcessID("generals.exe")
+	if err != nil {
+		return 0, fmt.Errorf("failed to find process: %w", err)
+	}
+
+	base, err := moduleBase(pid, "generals.exe")
+	if err != nil {
+		return 0, fmt.Errorf("failed to get module base: %w", err)
+	}
+
+	log.Printf("AOB Search: Module base at 0x%X, PID: %d", base, pid)
+
+	// Search in a reasonable range around the module base
+	// We'll search from base to base + 0x1000000 (16MB) which should be enough
+	searchStart := base
+	searchEnd := base + 0x1000000
+
+	log.Printf("AOB Search: Searching range 0x%X to 0x%X (0x%X bytes)", searchStart, searchEnd, searchEnd-searchStart)
+
+	// Read memory in chunks to search for the pattern
+	chunkSize := uintptr(0x10000) // 64KB chunks
+	buffer := make([]byte, chunkSize)
+	chunksSearched := 0
+	bytesSearched := uintptr(0)
+
+	for addr := searchStart; addr < searchEnd; addr += chunkSize {
+		// Adjust chunk size for the last chunk
+		remaining := searchEnd - addr
+		if remaining < chunkSize {
+			chunkSize = remaining
+			buffer = make([]byte, chunkSize)
+		}
+
+		// Read memory chunk
+		ok, bytesRead := r.rpmRaw(addr, buffer)
+		if !ok || bytesRead == 0 {
+			log.Printf("AOB Search: Failed to read memory at 0x%X (chunk %d)", addr, chunksSearched)
+			continue
+		}
+
+		chunksSearched++
+		bytesSearched += bytesRead
+
+		// Search for pattern in this chunk
+		for i := 0; i <= len(buffer)-len(patternBytes); i++ {
+			match := true
+			for j := 0; j < len(patternBytes); j++ {
+				if !wildcards[j] && buffer[i+j] != patternBytes[j] {
+					match = false
+					break
+				}
+			}
+
+			if match {
+				foundAddr := addr + uintptr(i)
+				// The pattern is "a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78"
+				// We want the address of the wildcard bytes (?? ?? ?? ??), not the "a1"
+				// The wildcards start at offset 1 from the beginning of the pattern
+				wildcardAddr := foundAddr + 1
+				log.Printf("AOB Search: Pattern found at 0x%X, wildcard section at 0x%X (offset from base: 0x%X) after searching %d chunks (%d bytes)",
+					foundAddr, wildcardAddr, wildcardAddr-base, chunksSearched, bytesSearched)
+				return wildcardAddr, nil
+			}
+		}
+
+		// Log progress every 100 chunks
+		if chunksSearched%100 == 0 {
+			log.Printf("AOB Search: Progress - searched %d chunks (%d bytes)", chunksSearched, bytesSearched)
+		}
+	}
+
+	log.Printf("AOB Search: Pattern not found after searching %d chunks (%d bytes)", chunksSearched, bytesSearched)
+	return 0, errors.New("pattern not found in memory")
+}
+
+// findInitialAddress uses AOB search to find the initial address
+func (r *Reader) findInitialAddress() (uintptr, error) {
+	pattern := "a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78"
+	log.Printf("AOB Find: Searching for initial address using pattern: %s", pattern)
+
+	// Find the pattern location
+	patternAddr, err := r.searchAOBPattern(pattern)
+	if err != nil {
+		return 0, err
+	}
+
+	log.Printf("AOB Find: Pattern found at 0x%X, reading 4-byte pointer...", patternAddr)
+
+	// The pattern location contains a pointer to the actual initial address
+	// Read the 4-byte pointer value at the found location
+	initialAddr, ok := r.rpmU32(patternAddr)
+	if !ok {
+		return 0, fmt.Errorf("failed to read pointer at pattern location 0x%X", patternAddr)
+	}
+
+	log.Printf("AOB Find: Pointer value at 0x%X is 0x%X (offset from base: 0x%X)",
+		patternAddr, initialAddr, uintptr(initialAddr)-r.base)
+
+	return uintptr(initialAddr), nil
 }
