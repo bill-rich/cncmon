@@ -213,6 +213,21 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 
 	// Start streaming replay events
 	fmt.Println("Starting replay streaming with real-time monitoring...")
+	for {
+		_, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
+		if err != nil {
+			fmt.Printf("Failed to start streaming: %v\n", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if streamingReplay.Header.Metadata.Seed == "" {
+			fmt.Println("Replay seed not yet available. Waiting...")
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		break
+	}
+
 	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
 	if err != nil {
 		fmt.Printf("Failed to start streaming: %v\n", err)
