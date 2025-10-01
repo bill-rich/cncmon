@@ -396,13 +396,22 @@ func (r *Reader) searchAOBPattern(pattern string, processName string) (uintptr, 
 
 // findInitialAddress uses AOB search to find the initial address
 func (r *Reader) findInitialAddress(processName string) (uintptr, error) {
-	pattern := "a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78"
-	log.Printf("AOB Find: Searching for initial address using pattern: %s", pattern)
+	// Try the primary pattern first - used in generlas.exe
+	primaryPattern := "a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78"
+	log.Printf("AOB Find: Searching for initial address using primary pattern: %s", primaryPattern)
 
-	// Find the pattern location
-	patternAddr, err := r.searchAOBPattern(pattern, processName)
+	patternAddr, err := r.searchAOBPattern(primaryPattern, processName)
 	if err != nil {
-		return 0, err
+		log.Printf("AOB Find: Primary pattern not found, trying fallback pattern...")
+
+		// Try the fallback pattern - Used in GeneralsOnlineZH_30.exe
+		fallbackPattern := "a1 ?? ?? ?? ?? 8b 48 0c 85 c9 74 74"
+		log.Printf("AOB Find: Searching for initial address using fallback pattern: %s", fallbackPattern)
+
+		patternAddr, err = r.searchAOBPattern(fallbackPattern, processName)
+		if err != nil {
+			return 0, fmt.Errorf("both primary and fallback patterns not found: %w", err)
+		}
 	}
 
 	log.Printf("AOB Find: Pattern found at 0x%X, reading 4-byte pointer...", patternAddr)
