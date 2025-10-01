@@ -144,9 +144,7 @@ func waitForGeneralsProcess(sigChan <-chan os.Signal) (*zhreader.Reader, error) 
 func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 	var lastSize int64 = -1
 	var lastModTime time.Time
-	noChangeCount := 0
 	initialWait := true
-	hasSeenActivity := false
 
 	fmt.Println("Waiting for replay file to be actively written to...")
 
@@ -183,32 +181,12 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 
 		// If file size or modification time changed, it's being written to
 		if currentSize != lastSize || !currentModTime.Equal(lastModTime) {
-			hasSeenActivity = true
 			lastSize = currentSize
 			lastModTime = currentModTime
-			noChangeCount = 0
 			fmt.Printf("File activity detected (size: %d bytes). Waiting for stability...\n", currentSize)
 			// Wait a bit more to ensure it's actively being written
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
-		// File size and modification time haven't changed
-		noChangeCount++
-
-		// If we've seen activity and file has been stable for a while, it's ready to read
-		if hasSeenActivity && noChangeCount > 10 { // 1 second of stability after activity
-			fmt.Println("File activity stopped. Starting to process...")
+			time.Sleep(500 * time.Millisecond)
 			return true
-		}
-
-		// If we haven't seen any activity for a long time, the file might be static
-		if !hasSeenActivity && noChangeCount > 50 { // 5 seconds of no activity
-			fmt.Println("No file activity detected. This appears to be a static file.")
-			fmt.Println("Use -test flag to process existing files, or wait for a new replay to be written.")
-			fmt.Println("Waiting for file activity... (Press Ctrl+C to exit)")
-			// Reset the counter and continue waiting indefinitely
-			noChangeCount = 0
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -269,7 +247,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 	lastEventTime := time.Now()
 
 	// Start 50ms polling timer
-	pollTicker := time.NewTicker(50 * time.Millisecond)
+	pollTicker := time.NewTicker(500 * time.Millisecond)
 	defer pollTicker.Stop()
 
 	for {
