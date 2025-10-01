@@ -64,14 +64,15 @@ type MODULEENTRY32 struct {
 
 type Reader struct {
 	hProc        windows.Handle
-	base         uintptr // generals.exe base
+	base         uintptr // process base
 	initialAddr  uintptr // cached initial address found via AOB
 	initialFound bool    // whether initial address has been found
+	processName  string  // process name for AOB search
 }
 
-// Init attaches to generals.exe and caches process handle + module base.
-func Init() (*Reader, error) {
-	pid, err := findProcessID("generals.exe")
+// Init attaches to the specified process and caches process handle + module base.
+func Init(processName string) (*Reader, error) {
+	pid, err := findProcessID(processName)
 	if err != nil {
 		return nil, err
 	}
@@ -79,12 +80,12 @@ func Init() (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	base, err := moduleBase(pid, "generals.exe")
+	base, err := moduleBase(pid, processName)
 	if err != nil {
 		_ = windows.CloseHandle(h)
 		return nil, err
 	}
-	return &Reader{hProc: h, base: base}, nil
+	return &Reader{hProc: h, base: base, processName: processName}, nil
 }
 
 func (r *Reader) Close() {
@@ -107,7 +108,7 @@ func (r *Reader) Poll() [8]int32 {
 	// Find initial address using AOB search if not already found
 	if !r.initialFound {
 		log.Printf("AOB Search: Starting pattern search for initial address...")
-		initialAddr, err := r.findInitialAddress()
+		initialAddr, err := r.findInitialAddress(r.processName)
 		if err != nil {
 			log.Printf("AOB Search: Pattern search failed (%v), falling back to hardcoded address 0x%X", err, 0x0062BAA0)
 			// If AOB search fails, fall back to hardcoded address as backup
@@ -311,19 +312,19 @@ func ParseAOBPattern(pattern string) ([]byte, []bool, error) {
 }
 
 // searchAOBPattern searches for the AOB pattern in process memory
-func (r *Reader) searchAOBPattern(pattern string) (uintptr, error) {
+func (r *Reader) searchAOBPattern(pattern string, processName string) (uintptr, error) {
 	patternBytes, wildcards, err := ParseAOBPattern(pattern)
 	if err != nil {
 		return 0, fmt.Errorf("failed to parse pattern: %w", err)
 	}
 
 	// Get module information to determine search range
-	pid, err := findProcessID("generals.exe")
+	pid, err := findProcessID(processName)
 	if err != nil {
 		return 0, fmt.Errorf("failed to find process: %w", err)
 	}
 
-	base, err := moduleBase(pid, "generals.exe")
+	base, err := moduleBase(pid, processName)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get module base: %w", err)
 	}
@@ -394,12 +395,12 @@ func (r *Reader) searchAOBPattern(pattern string) (uintptr, error) {
 }
 
 // findInitialAddress uses AOB search to find the initial address
-func (r *Reader) findInitialAddress() (uintptr, error) {
+func (r *Reader) findInitialAddress(processName string) (uintptr, error) {
 	pattern := "a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78"
 	log.Printf("AOB Find: Searching for initial address using pattern: %s", pattern)
 
 	// Find the pattern location
-	patternAddr, err := r.searchAOBPattern(pattern)
+	patternAddr, err := r.searchAOBPattern(pattern, processName)
 	if err != nil {
 		return 0, err
 	}
