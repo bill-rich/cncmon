@@ -47,12 +47,13 @@ func main() {
 
 	// Parse command line arguments
 	var (
-		replayFile = flag.String("file", defaultReplayFile, "Replay file to monitor")
-		pollDelay  = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
-		timeout    = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
-		apiURL     = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
-		testMode   = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
-		help       = flag.Bool("help", false, "Show help information")
+		replayFile  = flag.String("file", defaultReplayFile, "Replay file to monitor")
+		pollDelay   = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
+		timeout     = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
+		apiURL      = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
+		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
+		testMode    = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
+		help        = flag.Bool("help", false, "Show help information")
 	)
 	flag.Parse()
 
@@ -79,8 +80,8 @@ func main() {
 
 	// Continuous monitoring loop
 	for {
-		// Wait for generals.exe process to be available
-		memReader, err := waitForGeneralsProcess(sigChan)
+		// Wait for the specified process to be available
+		memReader, err := waitForGeneralsProcess(sigChan, *processName)
 		if err != nil {
 			fmt.Printf("Process monitoring interrupted: %v\n", err)
 			return
@@ -115,9 +116,9 @@ func main() {
 	}
 }
 
-// waitForGeneralsProcess waits for the generals.exe process to be available
-func waitForGeneralsProcess(sigChan <-chan os.Signal) (*zhreader.Reader, error) {
-	fmt.Println("Waiting for generals.exe process...")
+// waitForGeneralsProcess waits for the specified process to be available
+func waitForGeneralsProcess(sigChan <-chan os.Signal, processName string) (*zhreader.Reader, error) {
+	fmt.Printf("Waiting for %s process...\n", processName)
 
 	for {
 		// Check for interrupt signals
@@ -129,9 +130,9 @@ func waitForGeneralsProcess(sigChan <-chan os.Signal) (*zhreader.Reader, error) 
 		}
 
 		// Try to initialize memory reader
-		memReader, err := zhreader.Init()
+		memReader, err := zhreader.Init(processName)
 		if err == nil {
-			fmt.Println("Generals.exe process found and memory reader initialized successfully")
+			fmt.Printf("%s process found and memory reader initialized successfully\n", processName)
 			return memReader, nil
 		}
 
@@ -213,6 +214,21 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 
 	// Start streaming replay events
 	fmt.Println("Starting replay streaming with real-time monitoring...")
+	for {
+		_, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
+		if err != nil {
+			fmt.Printf("Failed to start streaming: %v\n", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if streamingReplay.Header.Metadata.Seed == "" {
+			fmt.Println("Replay seed not yet available. Waiting...")
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		break
+	}
+
 	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
 	if err != nil {
 		fmt.Printf("Failed to start streaming: %v\n", err)
@@ -422,6 +438,8 @@ func showHelp() {
 	fmt.Println("        Timeout for file inactivity before returning to waiting mode (default: 2m)")
 	fmt.Println("  -api string")
 	fmt.Println("        API endpoint URL for sending money data (default: https://cncstats.herokuapp.com)")
+	fmt.Println("  -process string")
+	fmt.Println("        Process name to monitor (default: generals.exe)")
 	fmt.Println("  -test")
 	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
 	fmt.Println("  -help")

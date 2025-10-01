@@ -11,9 +11,10 @@ type Reader struct {
 }
 
 // Init creates a mock reader for development on macOS
-func Init() (*Reader, error) {
-	fmt.Println("Warning: Running in development mode on macOS")
-	fmt.Println("Memory monitoring is only available on Windows")
+func Init(processName string) (*Reader, error) {
+	fmt.Printf("Warning: Running in development mode on macOS\n")
+	fmt.Printf("Memory monitoring is only available on Windows\n")
+	fmt.Printf("Process name: %s\n", processName)
 	return &Reader{}, nil
 }
 
