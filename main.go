@@ -17,6 +17,14 @@ import (
 	"github.com/bill-rich/cncstats/pkg/zhreplay"
 )
 
+var debugEnabled bool
+
+func debugLog(format string, args ...interface{}) {
+	if debugEnabled {
+		fmt.Printf("DEBUG: "+format, args...)
+	}
+}
+
 // EventData stores event information with money values for API transmission
 type EventData struct {
 	TimeCode    uint32   `json:"timeCode"`
@@ -54,12 +62,28 @@ func main() {
 		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
 		testMode    = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
 		help        = flag.Bool("help", false, "Show help information")
+
+		// File search flags
+		searchFile    = flag.String("search-file", "", "Search for patterns in a static executable file")
+		searchPattern = flag.String("search-pattern", "", "AOB pattern to search for (e.g., 'a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78')")
+		searchBinary  = flag.String("search-binary", "", "Binary pattern to search for (e.g., '10100001 ???????? ???????? ???????? ???????? 10001011 01***000 00001100 10000101 11****** 01110100 01111000')")
+		searchMode    = flag.String("search-mode", "aob", "Search mode: 'aob' for AOB patterns, 'binary' for binary patterns")
+		debugMode     = flag.Bool("debug", false, "Enable debug logging for troubleshooting")
 	)
 	flag.Parse()
+
+	// Set debug mode globally
+	debugEnabled = *debugMode
 
 	// Show help if requested
 	if *help {
 		showHelp()
+		return
+	}
+
+	// Handle file search mode
+	if *searchFile != "" {
+		handleFileSearch(*searchFile, *searchPattern, *searchBinary, *searchMode)
 		return
 	}
 
@@ -196,6 +220,8 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 
 // processReplayFile processes a replay file until completion or timeout
 func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string) int {
+	debugLog("Starting processReplayFile for: %s\n", replayFile)
+
 	// Create context with a much longer timeout to allow for real-time streaming
 	// The cncstats library will handle the actual timeout for new data
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -209,31 +235,73 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 		BufferSize:        100,
 	}
 
+	fmt.Printf("DEBUG: Waiting 5 seconds for seed to be written...\n")
 	// Give it some time to write the seed
 	time.Sleep(5 * time.Second)
 
 	// Start streaming replay events
-	fmt.Println("Starting replay streaming with real-time monitoring...")
-	for {
-		_, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
+	fmt.Println("DEBUG: Starting replay streaming with real-time monitoring...")
+
+	// Try to get the streaming replay with retries
+	var streamingReplay *zhreplay.StreamingReplay
+	var err error
+	maxRetries := 10
+	retryCount := 0
+
+	for retryCount < maxRetries {
+		fmt.Printf("DEBUG: Attempt %d/%d to start streaming...\n", retryCount+1, maxRetries)
+
+		_, streamingReplay, err = zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
 		if err != nil {
-			fmt.Printf("Failed to start streaming: %v\n", err)
+			fmt.Printf("DEBUG: Failed to start streaming (attempt %d): %v\n", retryCount+1, err)
 			time.Sleep(2 * time.Second)
+			retryCount++
 			continue
 		}
+
+		if streamingReplay == nil {
+			fmt.Printf("DEBUG: StreamingReplay is nil (attempt %d)\n", retryCount+1)
+			time.Sleep(2 * time.Second)
+			retryCount++
+			continue
+		}
+
+		if streamingReplay.Header == nil {
+			fmt.Printf("DEBUG: Header is nil (attempt %d)\n", retryCount+1)
+			time.Sleep(2 * time.Second)
+			retryCount++
+			continue
+		}
+
 		if streamingReplay.Header.Metadata.Seed == "" {
-			fmt.Println("Replay seed not yet available. Waiting...")
+			fmt.Printf("DEBUG: Replay seed not yet available (attempt %d). Waiting...\n", retryCount+1)
 			time.Sleep(2 * time.Second)
+			retryCount++
 			continue
 		}
+
+		fmt.Printf("DEBUG: Successfully got streaming replay with seed: %s\n", streamingReplay.Header.Metadata.Seed)
 		break
 	}
 
-	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
-	if err != nil {
-		fmt.Printf("Failed to start streaming: %v\n", err)
+	if retryCount >= maxRetries {
+		fmt.Printf("ERROR: Failed to start streaming after %d attempts\n", maxRetries)
 		return 0
 	}
+
+	fmt.Printf("DEBUG: Starting main streaming loop...\n")
+	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
+	if err != nil {
+		fmt.Printf("ERROR: Failed to start main streaming: %v\n", err)
+		return 0
+	}
+
+	if bodyChan == nil {
+		fmt.Printf("ERROR: bodyChan is nil\n")
+		return 0
+	}
+
+	fmt.Printf("DEBUG: Successfully started streaming, bodyChan created\n")
 
 	// Capture Seed from replay header
 	seed := streamingReplay.Header.Metadata.Seed
@@ -266,9 +334,38 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 	pollTicker := time.NewTicker(500 * time.Millisecond)
 	defer pollTicker.Stop()
 
+	fmt.Printf("DEBUG: Starting main event loop...\n")
+	loopCount := 0
+	startTime := time.Now()
+	maxWaitTime := 30 * time.Second // Maximum time to wait for events
+
 	for {
+		loopCount++
+		if loopCount%100 == 0 {
+			fmt.Printf("DEBUG: Main loop iteration %d, waiting for events...\n", loopCount)
+		}
+
+		// Check if we've been waiting too long without any events
+		if time.Since(startTime) > maxWaitTime && eventCount == 0 {
+			fmt.Printf("DEBUG: No events received after %v, this might indicate an issue\n", maxWaitTime)
+			fmt.Printf("DEBUG: File size: %d bytes, last modified: %v\n",
+				func() int64 {
+					if info, err := os.Stat(replayFile); err == nil {
+						return info.Size()
+					}
+					return -1
+				}(),
+				func() time.Time {
+					if info, err := os.Stat(replayFile); err == nil {
+						return info.ModTime()
+					}
+					return time.Time{}
+				}())
+		}
+
 		select {
 		case chunk, ok := <-bodyChan:
+			fmt.Printf("DEBUG: Received chunk from bodyChan (ok=%v)\n", ok)
 			if !ok {
 				fmt.Printf("\nStreaming completed (channel closed). Processed %d events.\n", eventCount)
 				fmt.Println("This could mean:")
@@ -298,8 +395,10 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 			}
 
 		case <-pollTicker.C:
+			fmt.Printf("DEBUG: Poll ticker fired, polling memory...\n")
 			// Poll memory every 50ms
 			vals := memReader.Poll()
+			fmt.Printf("DEBUG: Memory poll completed, got values: %v\n", vals)
 
 			// Check if all values are -1, which indicates the process may have gone away
 			allInvalid := true
@@ -352,8 +451,11 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 			}
 
 		case <-ctx.Done():
+			fmt.Printf("DEBUG: Context done signal received\n")
 			// Check if we timed out due to inactivity
-			if time.Since(lastEventTime) > timeout {
+			timeSinceLastEvent := time.Since(lastEventTime)
+			fmt.Printf("DEBUG: Time since last event: %v, timeout: %v\n", timeSinceLastEvent, timeout)
+			if timeSinceLastEvent > timeout {
 				fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
 			} else {
 				fmt.Printf("\nContext cancelled. Processed %d events before timeout.\n", eventCount)
@@ -423,6 +525,56 @@ func sendMoneyData(apiURL string, seed string, timeCode uint32, playerMoney [8]i
 	return nil
 }
 
+// handleFileSearch handles file pattern searching
+func handleFileSearch(filePath, aobPattern, binaryPattern, searchMode string) {
+	fmt.Printf("Searching for patterns in file: %s\n", filePath)
+	fmt.Printf("Search mode: %s\n", searchMode)
+	fmt.Println()
+
+	var results *zhreader.FileSearchResults
+	var err error
+
+	if searchMode == "binary" {
+		if binaryPattern == "" {
+			fmt.Println("Error: Binary pattern is required when using binary search mode.")
+			fmt.Println("Use -search-binary flag to specify the binary pattern.")
+			os.Exit(1)
+		}
+		fmt.Printf("Binary pattern: %s\n", binaryPattern)
+		results, err = zhreader.SearchBinaryPatternInFile(filePath, binaryPattern)
+	} else {
+		if aobPattern == "" {
+			fmt.Println("Error: AOB pattern is required when using AOB search mode.")
+			fmt.Println("Use -search-pattern flag to specify the AOB pattern.")
+			os.Exit(1)
+		}
+		fmt.Printf("AOB pattern: %s\n", aobPattern)
+		results, err = zhreader.SearchAOBPatternInFile(filePath, aobPattern)
+	}
+
+	if err != nil {
+		fmt.Printf("Error searching file: %v\n", err)
+		os.Exit(1)
+	}
+
+	if results.Found {
+		fmt.Printf("✓ Found %d matching pattern(s)!\n", len(results.Results))
+		fmt.Println()
+		for i, result := range results.Results {
+			fmt.Printf("Match %d:\n", i+1)
+			fmt.Printf("  Location: %s\n", result.HexOffset)
+			fmt.Printf("  Value: %s\n", result.Value)
+			fmt.Printf("  Decimal offset: %d\n", result.Location)
+			if i < len(results.Results)-1 {
+				fmt.Println()
+			}
+		}
+	} else {
+		fmt.Printf("✗ Pattern not found in file.\n")
+		os.Exit(1)
+	}
+}
+
 func showHelp() {
 	fmt.Println("CNC Monitor - Command and Conquer Replay Monitor with Memory Polling")
 	fmt.Println()
@@ -445,6 +597,28 @@ func showHelp() {
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()
+	fmt.Println("File Search Mode:")
+	fmt.Println("  -search-file string")
+	fmt.Println("        Search for patterns in a static executable file")
+	fmt.Println("  -search-pattern string")
+	fmt.Println("        AOB pattern to search for (e.g., 'a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78')")
+	fmt.Println("  -search-binary string")
+	fmt.Println("        Binary pattern to search for (e.g., '10100001 ???????? ???????? ???????? ???????? 10001011 01***000 00001100 10000101 11****** 01110100 01111000')")
+	fmt.Println("  -search-mode string")
+	fmt.Println("        Search mode: 'aob' for AOB patterns, 'binary' for binary patterns (default: aob)")
+	fmt.Println("  -debug")
+	fmt.Println("        Enable debug logging for troubleshooting")
+	fmt.Println()
+	fmt.Println("Examples:")
+	fmt.Println("  # Monitor replay file (default mode)")
+	fmt.Println("  cncmon -file C:\\replay.rep")
+	fmt.Println()
+	fmt.Println("  # Search for AOB pattern in executable")
+	fmt.Println("  cncmon -search-file C:\\game\\generals.exe -search-pattern 'a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78'")
+	fmt.Println()
+	fmt.Println("  # Search for binary pattern in executable")
+	fmt.Println("  cncmon -search-file C:\\game\\generals.exe -search-binary '10100001 ???????? ???????? ???????? ???????? 10001011 01***000 00001100 10000101 11****** 01110100 01111000' -search-mode binary")
+	fmt.Println()
 	fmt.Println("This tool continuously monitors a Command and Conquer replay file and polls memory values")
 	fmt.Println("from the running generals.exe process every 50ms. When money values change, it sends")
 	fmt.Println("events to the API using the last seen timecode from replay events. Multiple money changes")
@@ -452,4 +626,8 @@ func showHelp() {
 	fmt.Println("the end of the replay.")
 	fmt.Println("It waits for the file to be written to, processes it until completion or timeout,")
 	fmt.Println("then returns to waiting mode for the next replay.")
+	fmt.Println()
+	fmt.Println("File search mode allows you to search for patterns in static executable files without")
+	fmt.Println("requiring them to be running. This is useful for analyzing game executables to find")
+	fmt.Println("memory patterns and offsets.")
 }
