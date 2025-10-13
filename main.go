@@ -62,6 +62,7 @@ func main() {
 		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
 		testMode    = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
 		help        = flag.Bool("help", false, "Show help information")
+		seed        = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
 
 		// File search flags
 		searchFile    = flag.String("search-file", "", "Search for patterns in a static executable file")
@@ -114,27 +115,27 @@ func main() {
 		if *testMode {
 			// Test mode: process file immediately
 			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
-			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL)
+			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL, *seed)
 			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
 			memReader.Close()
 			fmt.Println("Test mode complete. Exiting.")
 			return
 		} else {
-			// Production mode: wait for file activity
-			if !waitForFileActivity(*replayFile, sigChan) {
+			// Production mode: wait for timecode to start increasing
+			if !waitForTimecodeStart(memReader, sigChan) {
 				memReader.Close()
-				fmt.Println("File monitoring interrupted. Exiting.")
+				fmt.Println("Timecode monitoring interrupted. Exiting.")
 				return
 			}
 
-			fmt.Printf("Replay file activity detected. Starting to monitor events...\n")
+			fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
 
-			// Process the replay file until completion or timeout
-			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL)
+			// Process money monitoring until completion or timeout
+			eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed)
 
-			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+			fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
 			memReader.Close()
-			fmt.Println("Returning to waiting mode for next replay...")
+			fmt.Println("Returning to waiting mode for next game...")
 			fmt.Println()
 		}
 	}
@@ -165,13 +166,13 @@ func waitForGeneralsProcess(sigChan <-chan os.Signal, processName string) (*zhre
 	}
 }
 
-// waitForFileActivity waits for the replay file to exist and start being written to
-func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
-	var lastSize int64 = -1
-	var lastModTime time.Time
-	initialWait := true
+// waitForTimecodeStart waits for the timecode to start increasing, indicating game start
+func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) bool {
+	fmt.Println("Waiting for timecode to start increasing (game start)...")
 
-	fmt.Println("Waiting for replay file to be actively written to...")
+	var lastTimecode uint32 = 0
+	var stableCount int = 0
+	const requiredStableReads = 3 // Need 3 consecutive reads of the same timecode to consider it stable
 
 	for {
 		// Check for interrupt signals
@@ -180,46 +181,42 @@ func waitForFileActivity(replayFile string, sigChan <-chan os.Signal) bool {
 			fmt.Printf("\nReceived signal %v. Shutting down gracefully...\n", sig)
 			return false
 		default:
-			// Continue with file checking
+			// Continue with timecode checking
 		}
 
-		// Check if file exists
-		info, err := os.Stat(replayFile)
+		// Get current timecode from memory
+		currentTimecode, err := memReader.GetTimecode()
 		if err != nil {
-			// File doesn't exist yet, wait a bit
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		currentSize := info.Size()
-		currentModTime := info.ModTime()
-
-		// If this is the first time we see the file, record its state and wait
-		if initialWait {
-			lastSize = currentSize
-			lastModTime = currentModTime
-			initialWait = false
-			fmt.Printf("File found (size: %d bytes). Waiting to detect write activity...\n", currentSize)
-			time.Sleep(1 * time.Second) // Wait longer to see if it's being written
-			continue
-		}
-
-		// If file size or modification time changed, it's being written to
-		if currentSize != lastSize || !currentModTime.Equal(lastModTime) {
-			lastSize = currentSize
-			lastModTime = currentModTime
-			fmt.Printf("File activity detected (size: %d bytes). Waiting for stability...\n", currentSize)
-			// Wait a bit more to ensure it's actively being written
+			fmt.Printf("Warning: Failed to read timecode: %v\n", err)
 			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
+		// Check if timecode is increasing
+		if currentTimecode > lastTimecode {
+			fmt.Printf("Timecode increased from %d to %d - game started!\n", lastTimecode, currentTimecode)
 			return true
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		// Check if timecode is stable (not changing)
+		if currentTimecode == lastTimecode && currentTimecode > 0 {
+			stableCount++
+			if stableCount >= requiredStableReads {
+				fmt.Printf("Timecode stable at %d for %d reads - game may have started\n", currentTimecode, stableCount)
+				return true
+			}
+		} else {
+			stableCount = 0
+		}
+
+		lastTimecode = currentTimecode
+		fmt.Printf("Current timecode: %d (waiting for increase...)\n", currentTimecode)
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
 // processReplayFile processes a replay file until completion or timeout
-func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string) int {
+func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
 	debugLog("Starting processReplayFile for: %s\n", replayFile)
 
 	// Create context with a much longer timeout to allow for real-time streaming
@@ -303,9 +300,15 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 
 	fmt.Printf("DEBUG: Successfully started streaming, bodyChan created\n")
 
-	// Capture Seed from replay header
-	seed := streamingReplay.Header.Metadata.Seed
-	fmt.Printf("Replay Seed: %s\n", seed)
+	// Determine seed to use
+	var seed string
+	if manualSeed != "" {
+		seed = manualSeed
+		fmt.Printf("Using manual seed: %s\n", seed)
+	} else {
+		seed = streamingReplay.Header.Metadata.Seed
+		fmt.Printf("Replay Seed: %s\n", seed)
+	}
 
 	// Initialize replay session data
 	session := &ReplaySession{
@@ -375,8 +378,16 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 				return eventCount
 			}
 
-			// Update last seen timecode from replay events (no filtering)
-			lastTimeCode = uint32(chunk.TimeCode)
+			// Get timecode from memory using binary search instead of replay file
+			memoryTimecode, err := memReader.GetTimecode()
+			if err != nil {
+				fmt.Printf("Warning: Failed to get timecode from memory: %v\n", err)
+				// Fall back to replay file timecode if memory timecode fails
+				lastTimeCode = uint32(chunk.TimeCode)
+			} else {
+				lastTimeCode = memoryTimecode
+				fmt.Printf("Memory Timecode: %d (from binary search)\n", memoryTimecode)
+			}
 			timeCodeIncrement = 0 // Reset increment when we get a new replay event
 			lastEventTime = time.Now()
 			eventCount++
@@ -424,16 +435,26 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 			}
 
 			if moneyChanged {
-				// Increment timecode if this is a subsequent change between replay events
-				if timeCodeIncrement > 0 {
-					timeCodeIncrement++
+				// Get current timecode from memory using binary search
+				currentTimecode, err := memReader.GetTimecode()
+				if err != nil {
+					fmt.Printf("  Warning: Failed to get timecode from memory: %v\n", err)
+					// Use last known timecode with increment as fallback
+					if timeCodeIncrement > 0 {
+						timeCodeIncrement++
+					} else {
+						timeCodeIncrement = 1
+					}
+					currentTimecode = lastTimeCode + timeCodeIncrement
 				} else {
-					timeCodeIncrement = 1
+					// Use the current timecode from memory
+					lastTimeCode = currentTimecode
+					timeCodeIncrement = 0 // Reset increment when we get a new timecode from memory
 				}
 
-				// Send money data via API with incremented timecode
-				fmt.Printf("  Money changed - sending data (timecode: %d + %d)...\n", lastTimeCode, timeCodeIncrement)
-				err := sendMoneyData(apiURL, session.Seed, lastTimeCode+timeCodeIncrement, vals)
+				// Send money data via API with current timecode
+				fmt.Printf("  Money changed - sending data (timecode: %d)...\n", currentTimecode)
+				err = sendMoneyData(apiURL, session.Seed, currentTimecode, vals)
 				if err != nil {
 					fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
 				} else {
@@ -460,6 +481,111 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 			} else {
 				fmt.Printf("\nContext cancelled. Processed %d events before timeout.\n", eventCount)
 			}
+			return eventCount
+		}
+	}
+}
+
+// processMoneyMonitoring monitors money values and timecode without replay file dependency
+func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
+	debugLog("Starting processMoneyMonitoring...\n")
+
+	// Initialize monitoring state
+	var lastMoneyValues [8]int32
+	var lastTimecode uint32
+	eventCount := 0
+	lastEventTime := time.Now()
+
+	// Start polling timer
+	pollTicker := time.NewTicker(500 * time.Millisecond)
+	defer pollTicker.Stop()
+
+	fmt.Printf("Starting money monitoring (polling every 500ms)...\n")
+	loopCount := 0
+	startTime := time.Now()
+
+	for {
+		loopCount++
+		if loopCount%20 == 0 { // Log every 10 seconds (20 * 500ms)
+			fmt.Printf("Money monitoring: iteration %d, events: %d\n", loopCount, eventCount)
+		}
+
+		// Check if we've been waiting too long without any events
+		if time.Since(startTime) > 30*time.Second && eventCount == 0 {
+			fmt.Printf("No money changes detected after 30 seconds, this might indicate an issue\n")
+		}
+
+		<-pollTicker.C
+		// Poll memory for money values
+		vals := memReader.Poll()
+		debugLog("Memory poll completed, got values: %v\n", vals)
+
+		// Check if all values are -1, which indicates the process may have gone away
+		allInvalid := true
+		for _, val := range vals {
+			if val != -1 {
+				allInvalid = false
+				break
+			}
+		}
+		if allInvalid {
+			fmt.Println("Warning: All memory values are invalid. Generals.exe process may have gone away.")
+			fmt.Println("Returning to process monitoring...")
+			return eventCount
+		}
+
+		// Get current timecode
+		currentTimecode, err := memReader.GetTimecode()
+		if err != nil {
+			fmt.Printf("Warning: Failed to get timecode: %v\n", err)
+			// Continue with money monitoring even if timecode fails
+		} else {
+			lastTimecode = currentTimecode
+			debugLog("Current timecode: %d\n", currentTimecode)
+		}
+
+		// Check if money values have changed
+		moneyChanged := false
+		for i, val := range vals {
+			if val != lastMoneyValues[i] {
+				moneyChanged = true
+				break
+			}
+		}
+
+		if moneyChanged {
+			eventCount++
+			fmt.Printf("Money changed (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+
+			// Determine seed to use for API calls
+			seedToUse := "direct-monitoring"
+			if manualSeed != "" {
+				seedToUse = manualSeed
+			}
+
+			// Send money data via API
+			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals)
+			if err != nil {
+				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
+			} else {
+				fmt.Println("Money data sent successfully")
+			}
+
+			// Display memory values
+			j, _ := json.Marshal(struct {
+				P [8]int32 `json:"p"`
+			}{vals})
+			fmt.Printf("Memory values: %s\n", string(j))
+
+			// Update last known values
+			lastMoneyValues = vals
+			lastEventTime = time.Now()
+		}
+
+		// Check for timeout due to inactivity
+		timeSinceLastEvent := time.Since(lastEventTime)
+		if timeSinceLastEvent > timeout {
+			fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
 			return eventCount
 		}
 	}
@@ -594,6 +720,8 @@ func showHelp() {
 	fmt.Println("        Process name to monitor (default: generals.exe)")
 	fmt.Println("  -test")
 	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
+	fmt.Println("  -seed string")
+	fmt.Println("        Manual seed value to use instead of reading from replay file")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()
@@ -612,6 +740,9 @@ func showHelp() {
 	fmt.Println("Examples:")
 	fmt.Println("  # Monitor replay file (default mode)")
 	fmt.Println("  cncmon -file C:\\replay.rep")
+	fmt.Println()
+	fmt.Println("  # Monitor with manual seed")
+	fmt.Println("  cncmon -seed \"my-custom-seed-123\"")
 	fmt.Println()
 	fmt.Println("  # Search for AOB pattern in executable")
 	fmt.Println("  cncmon -search-file C:\\game\\generals.exe -search-pattern 'a1 ?? ?? ?? ?? 8b 40 0c 85 c0 74 78'")
