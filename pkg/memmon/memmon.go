@@ -256,7 +256,6 @@ func (r *Reader) rpmRaw(addr uintptr, buf []byte) (bool, uintptr) {
 		uintptr(len(buf)),
 		uintptr(unsafe.Pointer(&read)),
 	)
-	log.Printf("ReadProcessMemory called: addr=0x%X, bufLen=%d, ret=%d, read=%d, buf=% X", addr, len(buf), ret, read, buf)
 	return ret != 0 && read == uintptr(len(buf)), read
 }
 
@@ -946,19 +945,12 @@ func (r *Reader) GetTimecode() (uint32, error) {
 	timecodeOffset := uintptr(0x3588EC)
 	timecodeAddr := r.base + timecodeOffset
 
-	log.Printf("Timecode: Reading from offset 0x%X (base: 0x%X + offset: 0x%X)", timecodeAddr, r.base, timecodeOffset)
-
 	initPtr, ok := r.rpmU32(timecodeAddr)
 	if !ok {
 		return 0, fmt.Errorf("failed to read initial pointer at address 0x%X", timecodeAddr)
 	}
 
-	log.Printf("Timecode: Initial pointer value: 0x%X", initPtr)
-	log.Printf("Timecode: initPtr uint32 value: %d", initPtr)
-	log.Printf("Timecode: initPtr int32 value: %d", int32(initPtr))
-
 	timecode, ok := r.rpmU32(uintptr(initPtr))
-
 	/*
 		// Read the 4-byte timecode value directly from the offset
 		timecode, ok := r.rpmU32(timecodeAddr)
