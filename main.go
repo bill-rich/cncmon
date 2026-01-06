@@ -56,7 +56,7 @@ func main() {
 	// Parse command line arguments
 	var (
 		replayFile  = flag.String("file", defaultReplayFile, "Replay file to monitor")
-		pollDelay   = flag.Duration("delay", 100*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
+		pollDelay   = flag.Duration("delay", 50*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
 		timeout     = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
 		apiURL      = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
 		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
@@ -226,9 +226,9 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 
 	// Configure streaming options for better real-time monitoring
 	options := &zhreplay.StreamReplayOptions{
-		PollInterval:      50 * time.Millisecond, // Check more frequently for new data
-		MaxWaitTime:       30 * time.Second,      // Max wait for individual operations
-		InactivityTimeout: timeout,               // Use our timeout for inactivity (2 minutes default)
+		PollInterval:      pollDelay * time.Millisecond, // Check more frequently for new data
+		MaxWaitTime:       30 * time.Second,             // Max wait for individual operations
+		InactivityTimeout: timeout,                      // Use our timeout for inactivity (2 minutes default)
 		BufferSize:        100,
 	}
 
@@ -334,7 +334,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 	lastEventTime := time.Now()
 
 	// Start 50ms polling timer
-	pollTicker := time.NewTicker(500 * time.Millisecond)
+	pollTicker := time.NewTicker(pollDelay * time.Millisecond)
 	defer pollTicker.Stop()
 
 	fmt.Printf("DEBUG: Starting main event loop...\n")
@@ -497,7 +497,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 	lastEventTime := time.Now()
 
 	// Start polling timer
-	pollTicker := time.NewTicker(500 * time.Millisecond)
+	pollTicker := time.NewTicker(pollDelay * time.Millisecond)
 	defer pollTicker.Stop()
 
 	fmt.Printf("Starting money monitoring (polling every 500ms)...\n")
