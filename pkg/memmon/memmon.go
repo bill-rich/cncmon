@@ -176,6 +176,41 @@ func (r *Reader) Poll() [8]int32 {
 	return out
 }
 
+// ReadPointerChain reads a value by following a chain of pointers using an initial address and offsets.
+// It reads the initial address, then for each offset (except the last), follows it as a pointer.
+// The last offset is used to read the final value, which is returned as uint32.
+// Returns (value, true) on success, (0, false) on failure.
+func (r *Reader) ReadPointerChain(initialAddr uintptr, offsets ...uint32) (uint32, bool) {
+	if r == nil || r.hProc == 0 || r.base == 0 {
+		return 0, false
+	}
+
+	if len(offsets) == 0 {
+		// No offsets provided, just read the initial address directly
+		return r.rpmU32(initialAddr)
+	}
+
+	// Read the initial address to get the first pointer
+	currentAddr, ok := r.rpmU32(initialAddr)
+	if !ok {
+		return 0, false
+	}
+
+	// Follow the pointer chain for all offsets except the last one
+	for i := 0; i < len(offsets)-1; i++ {
+		// Read the value at currentAddr + offset, which should be a pointer
+		nextAddr, ok := r.rpmU32(uintptr(currentAddr) + uintptr(offsets[i]))
+		if !ok {
+			return 0, false
+		}
+		currentAddr = nextAddr
+	}
+
+	// For the last offset, read and return the final value
+	value, ok := r.rpmU32(uintptr(currentAddr) + uintptr(offsets[len(offsets)-1]))
+	return value, ok
+}
+
 // --- Win32 helpers ---
 
 func findProcessID(exe string) (uint32, error) {
