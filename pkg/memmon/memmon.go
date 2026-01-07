@@ -933,3 +933,32 @@ func (r *Reader) findInitialAddress(processName string) (uintptr, error) {
 
 	return uintptr(initialAddr), nil
 }
+
+// GetTimecode reads the current timecode from memory using direct offset
+func (r *Reader) GetTimecode() (uint32, error) {
+	if r == nil || r.hProc == 0 || r.base == 0 {
+		return 0, fmt.Errorf("reader not initialized")
+	}
+
+	// Use direct offset: game.dat + 0x3588EC
+	// Convert hex offset to uintptr
+	timecodeOffset := uintptr(0x3588EC)
+	timecodeAddr := r.base + timecodeOffset
+
+	initPtr, ok := r.rpmU32(timecodeAddr)
+	if !ok {
+		return 0, fmt.Errorf("failed to read initial pointer at address 0x%X", timecodeAddr)
+	}
+
+	timecode, ok := r.rpmU32(uintptr(initPtr))
+	/*
+		// Read the 4-byte timecode value directly from the offset
+		timecode, ok := r.rpmU32(timecodeAddr)
+		if !ok {
+			return 0, fmt.Errorf("failed to read timecode value at address 0x%X", timecodeAddr)
+		}
+	*/
+
+	log.Printf("Timecode: Read timecode %d from address 0x%X", timecode, timecodeAddr)
+	return timecode, nil
+}
