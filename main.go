@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	zhreader "github.com/bill-rich/cncmon/pkg/memmon"
-	"github.com/bill-rich/cncstats/pkg/zhreplay"
 )
 
 var debugEnabled bool
@@ -60,7 +58,6 @@ func main() {
 		timeout     = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
 		apiURL      = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
 		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
-		testMode    = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
 		help        = flag.Bool("help", false, "Show help information")
 		seed        = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
 
@@ -112,32 +109,22 @@ func main() {
 			return
 		}
 
-		if *testMode {
-			// Test mode: process file immediately
-			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
-			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL, *seed)
-			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+		// Production mode: wait for timecode to start increasing
+		if !waitForTimecodeStart(memReader, sigChan) {
 			memReader.Close()
-			fmt.Println("Test mode complete. Exiting.")
+			fmt.Println("Timecode monitoring interrupted. Exiting.")
 			return
-		} else {
-			// Production mode: wait for timecode to start increasing
-			if !waitForTimecodeStart(memReader, sigChan) {
-				memReader.Close()
-				fmt.Println("Timecode monitoring interrupted. Exiting.")
-				return
-			}
-
-			fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
-
-			// Process money monitoring until completion or timeout
-			eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed)
-
-			fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
-			memReader.Close()
-			fmt.Println("Returning to waiting mode for next game...")
-			fmt.Println()
 		}
+
+		fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
+
+		// Process money monitoring until completion or timeout
+		eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed)
+
+		fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
+		memReader.Close()
+		fmt.Println("Returning to waiting mode for next game...")
+		fmt.Println()
 	}
 }
 
@@ -215,277 +202,6 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 	}
 }
 
-// processReplayFile processes a replay file until completion or timeout
-func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
-	debugLog("Starting processReplayFile for: %s\n", replayFile)
-
-	// Create context with a much longer timeout to allow for real-time streaming
-	// The cncstats library will handle the actual timeout for new data
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	// Configure streaming options for better real-time monitoring
-	options := &zhreplay.StreamReplayOptions{
-		PollInterval:      pollDelay * time.Millisecond, // Check more frequently for new data
-		MaxWaitTime:       30 * time.Second,             // Max wait for individual operations
-		InactivityTimeout: timeout,                      // Use our timeout for inactivity (2 minutes default)
-		BufferSize:        100,
-	}
-
-	fmt.Printf("DEBUG: Waiting 5 seconds for seed to be written...\n")
-	// Give it some time to write the seed
-	time.Sleep(5 * time.Second)
-
-	// Start streaming replay events
-	fmt.Println("DEBUG: Starting replay streaming with real-time monitoring...")
-
-	// Try to get the streaming replay with retries
-	var streamingReplay *zhreplay.StreamingReplay
-	var err error
-	maxRetries := 10
-	retryCount := 0
-
-	for retryCount < maxRetries {
-		fmt.Printf("DEBUG: Attempt %d/%d to start streaming...\n", retryCount+1, maxRetries)
-
-		_, streamingReplay, err = zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
-		if err != nil {
-			fmt.Printf("DEBUG: Failed to start streaming (attempt %d): %v\n", retryCount+1, err)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		if streamingReplay == nil {
-			fmt.Printf("DEBUG: StreamingReplay is nil (attempt %d)\n", retryCount+1)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		if streamingReplay.Header == nil {
-			fmt.Printf("DEBUG: Header is nil (attempt %d)\n", retryCount+1)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		if streamingReplay.Header.Metadata.Seed == "" {
-			fmt.Printf("DEBUG: Replay seed not yet available (attempt %d). Waiting...\n", retryCount+1)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		fmt.Printf("DEBUG: Successfully got streaming replay with seed: %s\n", streamingReplay.Header.Metadata.Seed)
-		break
-	}
-
-	if retryCount >= maxRetries {
-		fmt.Printf("ERROR: Failed to start streaming after %d attempts\n", maxRetries)
-		return 0
-	}
-
-	fmt.Printf("DEBUG: Starting main streaming loop...\n")
-	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
-	if err != nil {
-		fmt.Printf("ERROR: Failed to start main streaming: %v\n", err)
-		return 0
-	}
-
-	if bodyChan == nil {
-		fmt.Printf("ERROR: bodyChan is nil\n")
-		return 0
-	}
-
-	fmt.Printf("DEBUG: Successfully started streaming, bodyChan created\n")
-
-	// Determine seed to use
-	var seed string
-	if manualSeed != "" {
-		seed = manualSeed
-		fmt.Printf("Using manual seed: %s\n", seed)
-	} else {
-		seed = streamingReplay.Header.Metadata.Seed
-		fmt.Printf("Replay Seed: %s\n", seed)
-	}
-
-	// Initialize replay session data
-	session := &ReplaySession{
-		Seed:       seed,
-		Events:     make([]EventData, 0),
-		EventCount: 0,
-	}
-
-	// Print header information
-	fmt.Printf("Replay Header:\n")
-	fmt.Printf("  Map: %s\n", streamingReplay.Header.Metadata.MapFile)
-	fmt.Printf("  Players: %d\n", len(streamingReplay.Header.Metadata.Players))
-	for i, player := range streamingReplay.Header.Metadata.Players {
-		fmt.Printf("    Player %d: %s (Team %s)\n", i+1, player.Name, player.Team)
-	}
-	fmt.Println()
-
-	// Initialize polling state
-	var lastMoneyValues [8]int32
-	var lastTimeCode uint32
-	var timeCodeIncrement uint32
-	eventCount := 0
-	lastEventTime := time.Now()
-
-	// Start 50ms polling timer
-	pollTicker := time.NewTicker(pollDelay * time.Millisecond)
-	defer pollTicker.Stop()
-
-	fmt.Printf("DEBUG: Starting main event loop...\n")
-	loopCount := 0
-	startTime := time.Now()
-	maxWaitTime := 30 * time.Second // Maximum time to wait for events
-
-	for {
-		loopCount++
-		if loopCount%100 == 0 {
-			fmt.Printf("DEBUG: Main loop iteration %d, waiting for events...\n", loopCount)
-		}
-
-		// Check if we've been waiting too long without any events
-		if time.Since(startTime) > maxWaitTime && eventCount == 0 {
-			fmt.Printf("DEBUG: No events received after %v, this might indicate an issue\n", maxWaitTime)
-			fmt.Printf("DEBUG: File size: %d bytes, last modified: %v\n",
-				func() int64 {
-					if info, err := os.Stat(replayFile); err == nil {
-						return info.Size()
-					}
-					return -1
-				}(),
-				func() time.Time {
-					if info, err := os.Stat(replayFile); err == nil {
-						return info.ModTime()
-					}
-					return time.Time{}
-				}())
-		}
-
-		select {
-		case chunk, ok := <-bodyChan:
-			fmt.Printf("DEBUG: Received chunk from bodyChan (ok=%v)\n", ok)
-			if !ok {
-				fmt.Printf("\nStreaming completed (channel closed). Processed %d events.\n", eventCount)
-				fmt.Println("This could mean:")
-				fmt.Println("  - EndReplay command was received")
-				fmt.Println("  - File reached end and no new data for 2 minutes")
-				fmt.Println("  - Context was cancelled")
-				return eventCount
-			}
-
-			// Get timecode from memory using binary search instead of replay file
-			memoryTimecode, err := memReader.GetTimecode()
-			if err != nil {
-				fmt.Printf("Warning: Failed to get timecode from memory: %v\n", err)
-				// Fall back to replay file timecode if memory timecode fails
-				lastTimeCode = uint32(chunk.TimeCode)
-			} else {
-				lastTimeCode = memoryTimecode
-				fmt.Printf("Memory Timecode: %d (from binary search)\n", memoryTimecode)
-			}
-			timeCodeIncrement = 0 // Reset increment when we get a new replay event
-			lastEventTime = time.Now()
-			eventCount++
-
-			// Print replay event information (for debugging)
-			fmt.Printf("Replay Event: Time=%d, Order=%s, PlayerID=%d", chunk.TimeCode, chunk.OrderName, chunk.PlayerID)
-			if chunk.PlayerName != "" {
-				fmt.Printf(", Player=%s", chunk.PlayerName)
-			}
-			fmt.Println()
-
-			// Check for EndReplay command
-			if chunk.OrderCode == 27 {
-				fmt.Println("EndReplay command detected - streaming will stop.")
-				return eventCount
-			}
-
-		case <-pollTicker.C:
-			fmt.Printf("DEBUG: Poll ticker fired, polling memory...\n")
-			// Poll memory every 50ms
-			vals := memReader.Poll()
-			fmt.Printf("DEBUG: Memory poll completed, got values: %v\n", vals)
-
-			// Check if all values are -1, which indicates the process may have gone away
-			allInvalid := true
-			for _, val := range vals.Money {
-				if val != -1 {
-					allInvalid = false
-					break
-				}
-			}
-			if allInvalid {
-				fmt.Println("  Warning: All memory values are invalid. Generals.exe process may have gone away.")
-				fmt.Println("  Returning to process monitoring...")
-				return eventCount
-			}
-
-			// Check if money values have changed
-			moneyChanged := false
-			for i, val := range vals {
-				if val != lastMoneyValues[i] {
-					moneyChanged = true
-					break
-				}
-			}
-
-			if moneyChanged {
-				// Get current timecode from memory using binary search
-				currentTimecode, err := memReader.GetTimecode()
-				if err != nil {
-					fmt.Printf("  Warning: Failed to get timecode from memory: %v\n", err)
-					// Use last known timecode with increment as fallback
-					if timeCodeIncrement > 0 {
-						timeCodeIncrement++
-					} else {
-						timeCodeIncrement = 1
-					}
-					currentTimecode = lastTimeCode + timeCodeIncrement
-				} else {
-					// Use the current timecode from memory
-					lastTimeCode = currentTimecode
-					timeCodeIncrement = 0 // Reset increment when we get a new timecode from memory
-				}
-
-				// Send money data via API with current timecode
-				fmt.Printf("  Money changed - sending data (timecode: %d)...\n", currentTimecode)
-				err = sendMoneyData(apiURL, session.Seed, currentTimecode, vals)
-				if err != nil {
-					fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
-				} else {
-					fmt.Println("  Money data sent successfully")
-				}
-
-				// Display memory values
-				j, _ := json.Marshal(struct {
-					P [8]int32 `json:"p"`
-				}{vals})
-				fmt.Printf("  Memory values: %s\n", string(j))
-
-				// Update last known values
-				lastMoneyValues = vals
-			}
-
-		case <-ctx.Done():
-			fmt.Printf("DEBUG: Context done signal received\n")
-			// Check if we timed out due to inactivity
-			timeSinceLastEvent := time.Since(lastEventTime)
-			fmt.Printf("DEBUG: Time since last event: %v, timeout: %v\n", timeSinceLastEvent, timeout)
-			if timeSinceLastEvent > timeout {
-				fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
-			} else {
-				fmt.Printf("\nContext cancelled. Processed %d events before timeout.\n", eventCount)
-			}
-			return eventCount
-		}
-	}
-}
-
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
 func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
 	debugLog("Starting processMoneyMonitoring...\n")
@@ -522,7 +238,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 		// Check if all values are -1, which indicates the process may have gone away
 		allInvalid := true
-		for _, val := range vals {
+		for _, val := range vals.Money {
 			if val != -1 {
 				allInvalid = false
 				break
@@ -546,7 +262,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 		// Check if money values have changed
 		moneyChanged := false
-		for i, val := range vals {
+		for i, val := range vals.Money {
 			if val != lastMoneyValues[i] {
 				moneyChanged = true
 				break
@@ -564,7 +280,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			}
 
 			// Send money data via API
-			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals)
+			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals.Money)
 			if err != nil {
 				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
 			} else {
@@ -574,11 +290,11 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			// Display memory values
 			j, _ := json.Marshal(struct {
 				P [8]int32 `json:"p"`
-			}{vals})
+			}{vals.Money})
 			fmt.Printf("Memory values: %s\n", string(j))
 
 			// Update last known values
-			lastMoneyValues = vals
+			lastMoneyValues = vals.Money
 			lastEventTime = time.Now()
 		}
 
