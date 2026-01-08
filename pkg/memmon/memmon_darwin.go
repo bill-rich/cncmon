@@ -15,6 +15,29 @@ type Reader struct {
 	// Mock implementation for macOS development
 }
 
+type PollResult struct {
+	Money                    [8]int32
+	MoneyEarned              [8]int32
+	UnitsBuilt               [8]int32
+	UnitsLost                [8]int32
+	PowerTotal               [8]int32
+	PowerUsed                [8]int32
+	RadarsBuilt              [8]int32
+	SearchAndDestroy         [8]int32
+	HoldTheLine              [8]int32
+	Bombardment              [8]int32
+	XP                       [8]int32
+	XPLevel                  [8]int32
+	GeneralsPointsUsed       [8]int32
+	GeneralsPointsTotal      [8]int32
+	TechBuildingsCaptured    [8]int32
+	FactionBuildingsCaptured [8]int32
+	UnitsKilled              [8][8]int32
+	BuildingsBuilt           [8]int32
+	BuildingsLost            [8]int32
+	BuildingsKilled          [8][8]int32
+}
+
 // Init creates a mock reader for development on macOS
 func Init(processName string) (*Reader, error) {
 	fmt.Printf("Warning: Running in development mode on macOS\n")
@@ -28,9 +51,16 @@ func (r *Reader) Close() {
 }
 
 // Poll returns mock data for development
-func (r *Reader) Poll() [8]int32 {
+func (r *Reader) Poll() PollResult {
 	// Return mock data for development
-	return [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000}
+	return PollResult{
+		Money:       [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+		MoneyEarned: [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+		UnitsBuilt:  [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+		UnitsLost:   [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+		PowerTotal:  [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+		PowerUsed:   [8]int32{1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000},
+	}
 }
 
 // FileSearchResult contains the result of a file pattern search

@@ -413,7 +413,7 @@ func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay 
 
 			// Check if all values are -1, which indicates the process may have gone away
 			allInvalid := true
-			for _, val := range vals {
+			for _, val := range vals.Money {
 				if val != -1 {
 					allInvalid = false
 					break

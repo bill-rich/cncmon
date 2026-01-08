@@ -27,6 +27,10 @@ var (
 	procCloseHandle              = kernel32.NewProc("CloseHandle")
 )
 
+const unitsBuiltInitialAddr = 0x0062B688
+
+var playerOffsets = [9]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C}
+
 const (
 	PROCESS_VM_READ           = 0x0010
 	PROCESS_QUERY_INFORMATION = 0x0400
@@ -72,6 +76,29 @@ type Reader struct {
 	processName  string  // process name for AOB search
 }
 
+type PollResult struct {
+	Money                    [8]int32
+	MoneyEarned              [8]int32
+	UnitsBuilt               [8]int32
+	UnitsLost                [8]int32
+	PowerTotal               [8]int32
+	PowerUsed                [8]int32
+	RadarsBuilt              [8]int32
+	SearchAndDestroy         [8]int32
+	HoldTheLine              [8]int32
+	Bombardment              [8]int32
+	XP                       [8]int32
+	XPLevel                  [8]int32
+	GeneralsPointsUsed       [8]int32
+	GeneralsPointsTotal      [8]int32
+	TechBuildingsCaptured    [8]int32
+	FactionBuildingsCaptured [8]int32
+	UnitsKilled              [8][8]int32
+	BuildingsBuilt           [8]int32
+	BuildingsLost            [8]int32
+	BuildingsKilled          [8][8]int32
+}
+
 // Init attaches to the specified process and caches process handle + module base.
 func Init(processName string) (*Reader, error) {
 	pid, err := findProcessID(processName)
@@ -98,15 +125,66 @@ func (r *Reader) Close() {
 }
 
 // Poll returns money for players P1..P8 (len=8). -1 means read failed for that slot.
-func (r *Reader) Poll() [8]int32 {
-	var out [8]int32
+func (r *Reader) Poll() PollResult {
+	if r == nil || r.hProc == 0 || r.base == 0 {
+		return PollResult{}
+	}
+
+	result := PollResult{
+		Money:                    r.pollPlayerMoney(playerOffsets),
+		MoneyEarned:              r.pollForAllPlayers(unitsBuiltInitialAddr, 0x2E4),
+		UnitsBuilt:               r.pollForAllPlayers(unitsBuiltInitialAddr, 0x2D0),
+		UnitsLost:                r.pollForAllPlayers(unitsBuiltInitialAddr, 0x2D4),
+		BuildingsBuilt:           r.pollForAllPlayers(unitsBuiltInitialAddr, 0x318),
+		BuildingsLost:            r.pollForAllPlayers(unitsBuiltInitialAddr, 0x31c),
+		BuildingsKilled:          r.PollForAllPlayersArray(unitsBuiltInitialAddr, 0x2E0),
+		UnitsKilled:              r.PollForAllPlayersArray(unitsBuiltInitialAddr, 0x298),
+		GeneralsPointsTotal:      r.pollForAllPlayers(unitsBuiltInitialAddr, 0x84),
+		GeneralsPointsUsed:       r.pollForAllPlayers(unitsBuiltInitialAddr, 0x88),
+		RadarsBuilt:              r.pollForAllPlayers(unitsBuiltInitialAddr, 0x44),
+		SearchAndDestroy:         r.pollForAllPlayers(unitsBuiltInitialAddr, 0x58),
+		HoldTheLine:              r.pollForAllPlayers(unitsBuiltInitialAddr, 0x54),
+		Bombardment:              r.pollForAllPlayers(unitsBuiltInitialAddr, 0x50),
+		XP:                       r.pollForAllPlayers(unitsBuiltInitialAddr, 0x18c),
+		XPLevel:                  r.pollForAllPlayers(unitsBuiltInitialAddr, 0x188),
+		TechBuildingsCaptured:    r.pollForAllPlayers(unitsBuiltInitialAddr, 0x320),
+		FactionBuildingsCaptured: r.pollForAllPlayers(unitsBuiltInitialAddr, 0x324),
+		PowerTotal:               r.pollForAllPlayers(unitsBuiltInitialAddr, 0x84),
+		PowerUsed:                r.pollForAllPlayers(unitsBuiltInitialAddr, 0x88),
+	}
+	log.Printf("PollResult: %v", result)
+	return result
+}
+
+func (r *Reader) PollForAllPlayersArray(initialAddr uintptr, finalOffset uint32, offsets ...uint32) [8][8]int32 {
+	out := [8][8]int32{}
+	for n, playerOffset := range playerOffsets {
+		for i := 0; i < 8; i++ {
+			adjustedFinalOffset := finalOffset + uint32(4*i)
+			newOffsets := append(offsets, adjustedFinalOffset)
+			out[n] = r.pollForAllPlayers(initialAddr, append([]uint32{uint32(playerOffset)}, newOffsets...)...)
+		}
+	}
+	return out
+}
+
+func (r *Reader) pollForAllPlayers(initialAddr uintptr, offsets ...uint32) [8]int32 {
+	out := [8]int32{}
 	for i := range out {
 		out[i] = -1
 	}
-	if r == nil || r.hProc == 0 || r.base == 0 {
-		return out
+	for playerOffset := range playerOffsets {
+		val, ok := r.ReadPointerChain(r.initialAddr, append([]uint32{uint32(playerOffset)}, offsets...)...)
+		if !ok {
+			out[playerOffset] = -1
+			continue
+		}
+		out[playerOffset] = int32(val)
 	}
+	return out
+}
 
+func (r *Reader) pollPlayerMoney(playerOffsets [9]uint32) [8]int32 {
 	// Find initial address using AOB search if not already found
 	if !r.initialFound {
 		log.Printf("AOB Search: Starting pattern search for initial address...")
@@ -122,32 +200,16 @@ func (r *Reader) Poll() [8]int32 {
 		r.initialFound = true
 	}
 
-	playerOffsets := [9]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C}
-
-	// root = *(base + initial)
-	// log.Printf("AOB Poll: Using cached initial address 0x%X (offset: 0x%X)", r.initialAddr, r.initialAddr-r.base)
-	// root, ok := r.rpmU32(r.base + r.initialAddr)
-	root, ok := r.rpmU32(r.initialAddr)
-	if !ok {
-		log.Printf("AOB Poll: Failed to read root pointer at 0x%X", r.base+r.initialAddr)
-		return out
-	}
-	// log.Printf("AOB Poll: Root pointer value: 0x%X", root)
-
-	// Read all 9 values first
+	// Read all 9 values first using ReadPointerChain
 	var tempValues [9]int32
 	for i := 0; i < 9; i++ {
-		mid, ok := r.rpmU32(uintptr(root) + uintptr(playerOffsets[i]))
+		val, ok := r.ReadPointerChain(r.initialAddr, playerOffsets[i], 0x38)
 		if !ok {
 			tempValues[i] = -1
 			continue
 		}
-		val, ok := r.rpmI32(uintptr(mid) + 0x38)
-		if !ok {
-			tempValues[i] = -1
-			continue
-		}
-		tempValues[i] = val
+		// Convert uint32 to int32 (the value is actually signed)
+		tempValues[i] = int32(val)
 	}
 
 	// Find the last positive value and replace it and following zeros with -1
@@ -168,6 +230,8 @@ func (r *Reader) Poll() [8]int32 {
 		// Also replace the last positive value itself
 		tempValues[lastPositiveIndex] = -1
 	}
+
+	out := [8]int32{}
 
 	// Copy the first 8 values to the output array
 	for i := 0; i < 8; i++ {
