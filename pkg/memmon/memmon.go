@@ -160,8 +160,6 @@ func (r *Reader) Poll() PollResult {
 		PowerTotal:               r.pollForAllPlayers(unitsBuiltInitialAddr, 0x84),
 		PowerUsed:                r.pollForAllPlayers(unitsBuiltInitialAddr, 0x88),
 	}
-	testres := r.pollForAllPlayers(unitsBuiltInitialAddr, 0x298)
-	log.Printf("BILL - testres: %v", testres)
 	return result
 }
 

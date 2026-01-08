@@ -460,3 +460,17 @@ func findWildcardOffsetInFile(pattern string) int {
 	// If no ? found, return 0 (shouldn't happen for valid patterns)
 	return 0
 }
+
+// GetTimecode reads the current timecode from memory using direct offset (mock implementation)
+func (r *Reader) GetTimecode() (uint32, error) {
+	// Mock implementation for development on macOS
+	fmt.Printf("Warning: Timecode reading not available on macOS\n")
+	fmt.Printf("Would read from offset: generals.exe+63ABE0\n")
+	return 0, fmt.Errorf("timecode reading not available on macOS")
+}
+
+// GetSeed returns the seed value (mock implementation)
+func (r *Reader) GetSeed() string {
+	// Mock implementation for development on macOS
+	return "mock-seed-macos"
+}

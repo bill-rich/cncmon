@@ -467,3 +467,9 @@ func (r *Reader) GetTimecode() (uint32, error) {
 	fmt.Printf("Would read from offset: generals.exe+63ABE0\n")
 	return 0, fmt.Errorf("timecode reading not available on macOS")
 }
+
+// GetSeed returns the seed value (mock implementation)
+func (r *Reader) GetSeed() string {
+	// Mock implementation for development on macOS
+	return "mock-seed-macos"
+}

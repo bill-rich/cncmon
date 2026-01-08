@@ -159,8 +159,8 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 	fmt.Println("Waiting for timecode to start increasing (game start)...")
 
 	var lastTimecode uint32 = 0
-	var stableCount int = 0
-	const requiredStableReads = 3 // Need 3 consecutive reads of the same timecode to consider it stable
+	var increaseCount int = 0
+	const requiredIncreases = 3 // Need 3 consecutive increases to consider the game started
 
 	for {
 		// Check for interrupt signals
@@ -180,25 +180,36 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 			continue
 		}
 
-		// Check if timecode is increasing
-		if currentTimecode > lastTimecode {
-			fmt.Printf("Timecode increased from %d to %d - game started!\n", lastTimecode, currentTimecode)
-			return true
-		}
-
-		// Check if timecode is stable (not changing)
-		if currentTimecode == lastTimecode && currentTimecode > 0 {
-			stableCount++
-			if stableCount >= requiredStableReads {
-				fmt.Printf("Timecode stable at %d for %d reads - game may have started\n", currentTimecode, stableCount)
-				return true
+		// Only start once we've seen requiredIncreases consecutive increases in timecode.
+		if lastTimecode != 0 {
+			if currentTimecode > lastTimecode {
+				increaseCount++
+				fmt.Printf("Timecode increased from %d to %d (%d/%d consecutive increases)\n",
+					lastTimecode, currentTimecode, increaseCount, requiredIncreases)
+				if increaseCount >= requiredIncreases {
+					// Check money values - don't start if they match the default/initial state
+					pollResult := memReader.Poll()
+					expectedMoney := [8]int32{10000, 10000, 10000, 10000, 10000, 10000, 10000, -1}
+					if pollResult.Money == expectedMoney {
+						fmt.Printf("Money values match default state [10000, 10000, 10000, 10000, 10000, 10000, 10000, -1] - not starting monitoring, resetting detection\n")
+						increaseCount = 0
+						lastTimecode = 0 // Reset to start fresh
+						continue
+					}
+					fmt.Printf("Timecode has increased %d times consecutively - game started!\n", requiredIncreases)
+					return true
+				}
+			} else if currentTimecode < lastTimecode {
+				// Timecode went backwards – reset detection and wait for a fresh sequence
+				fmt.Printf("Timecode decreased from %d to %d - resetting start detection and waiting for new game...\n",
+					lastTimecode, currentTimecode)
+				increaseCount = 0
 			}
-		} else {
-			stableCount = 0
+			// If equal, do nothing special – just keep waiting
 		}
 
 		lastTimecode = currentTimecode
-		fmt.Printf("Current timecode: %d (waiting for increase...)\n", currentTimecode)
+		fmt.Printf("Current timecode: %d (waiting for %d consecutive increases...)\n", currentTimecode, requiredIncreases)
 		time.Sleep(500 * time.Millisecond)
 	}
 }
@@ -336,6 +347,13 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			fmt.Printf("Warning: Failed to get timecode: %v\n", err)
 			// Continue with money monitoring even if timecode fails
 		} else {
+			// If timecode ever decreases, assume this game session has ended
+			// and return so the caller can wait for a new game.
+			if lastTimecode != 0 && currentTimecode < lastTimecode {
+				fmt.Printf("Timecode decreased from %d to %d - ending monitoring and returning to waiting mode...\n",
+					lastTimecode, currentTimecode)
+				return eventCount
+			}
 			lastTimecode = currentTimecode
 			debugLog("Current timecode: %d\n", currentTimecode)
 		}
