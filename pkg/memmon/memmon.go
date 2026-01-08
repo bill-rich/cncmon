@@ -124,6 +124,14 @@ func (r *Reader) Close() {
 	}
 }
 
+func (r *Reader) GetSeed() string {
+	seed, ok := r.ReadPointerChain(0x0062B9FC)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%d", seed)
+}
+
 // Poll returns money for players P1..P8 (len=8). -1 means read failed for that slot.
 func (r *Reader) Poll() PollResult {
 	if r == nil || r.hProc == 0 || r.base == 0 {

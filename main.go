@@ -274,7 +274,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			fmt.Printf("Money changed (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
 
 			// Determine seed to use for API calls
-			seedToUse := "direct-monitoring"
+			seedToUse := memReader.GetSeed()
 			if manualSeed != "" {
 				seedToUse = manualSeed
 			}
