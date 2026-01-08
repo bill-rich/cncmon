@@ -364,6 +364,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 		if valuesChanged {
 			eventCount++
+			isFirstPoll := firstPoll // Capture the flag before it's updated
 			if firstPoll {
 				fmt.Printf("Initial poll (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
 				firstPoll = false
@@ -377,8 +378,8 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 				seedToUse = manualSeed
 			}
 
-			// Send money data via API
-			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals)
+			// Send money data via API (only changed fields will be included)
+			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals, lastSentPollResult, isFirstPoll)
 			if err != nil {
 				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
 				// Don't update lastSentPollResult if send failed
@@ -406,57 +407,101 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 }
 
 // MoneyDataRequest represents the API request for player money data
+// Only changed fields are included (except Seed and Timecode which are always included)
 type MoneyDataRequest struct {
-	Seed                     string      `json:"seed"`
-	Timecode                 int64       `json:"timecode"`
-	Money                    [8]int32    `json:"money"`
-	MoneyEarned              [8]int32    `json:"money_earned"`
-	UnitsBuilt               [8]int32    `json:"units_built"`
-	UnitsLost                [8]int32    `json:"units_lost"`
-	BuildingsBuilt           [8]int32    `json:"buildings_built"`
-	BuildingsLost            [8]int32    `json:"buildings_lost"`
-	BuildingsKilled          [8][8]int32 `json:"buildings_killed"`
-	UnitsKilled              [8][8]int32 `json:"units_killed"`
-	GeneralsPointsTotal      [8]int32    `json:"generals_points_total"`
-	GeneralsPointsUsed       [8]int32    `json:"generals_points_used"`
-	RadarsBuilt              [8]int32    `json:"radars_built"`
-	SearchAndDestroy         [8]int32    `json:"search_and_destroy"`
-	HoldTheLine              [8]int32    `json:"hold_the_line"`
-	Bombardment              [8]int32    `json:"bombardment"`
-	XP                       [8]int32    `json:"xp"`
-	XPLevel                  [8]int32    `json:"xp_level"`
-	TechBuildingsCaptured    [8]int32    `json:"tech_buildings_captured"`
-	FactionBuildingsCaptured [8]int32    `json:"faction_buildings_captured"`
-	PowerTotal               [8]int32    `json:"power_total"`
-	PowerUsed                [8]int32    `json:"power_used"`
+	Seed                     string       `json:"seed"`
+	Timecode                 int64        `json:"timecode"`
+	Money                    *[8]int32    `json:"money,omitempty"`
+	MoneyEarned              *[8]int32    `json:"money_earned,omitempty"`
+	UnitsBuilt               *[8]int32    `json:"units_built,omitempty"`
+	UnitsLost                *[8]int32    `json:"units_lost,omitempty"`
+	BuildingsBuilt           *[8]int32    `json:"buildings_built,omitempty"`
+	BuildingsLost            *[8]int32    `json:"buildings_lost,omitempty"`
+	BuildingsKilled          *[8][8]int32 `json:"buildings_killed,omitempty"`
+	UnitsKilled              *[8][8]int32 `json:"units_killed,omitempty"`
+	GeneralsPointsTotal      *[8]int32    `json:"generals_points_total,omitempty"`
+	GeneralsPointsUsed       *[8]int32    `json:"generals_points_used,omitempty"`
+	RadarsBuilt              *[8]int32    `json:"radars_built,omitempty"`
+	SearchAndDestroy         *[8]int32    `json:"search_and_destroy,omitempty"`
+	HoldTheLine              *[8]int32    `json:"hold_the_line,omitempty"`
+	Bombardment              *[8]int32    `json:"bombardment,omitempty"`
+	XP                       *[8]int32    `json:"xp,omitempty"`
+	XPLevel                  *[8]int32    `json:"xp_level,omitempty"`
+	TechBuildingsCaptured    *[8]int32    `json:"tech_buildings_captured,omitempty"`
+	FactionBuildingsCaptured *[8]int32    `json:"faction_buildings_captured,omitempty"`
+	PowerTotal               *[8]int32    `json:"power_total,omitempty"`
+	PowerUsed                *[8]int32    `json:"power_used,omitempty"`
 }
 
 // sendMoneyData sends player money data to the API endpoint
-func sendMoneyData(apiURL string, seed string, timeCode uint32, pollResult zhreader.PollResult) error {
-	// Create the request payload with all pollresult data
+// Only changed fields are included (except Seed and Timecode which are always included)
+func sendMoneyData(apiURL string, seed string, timeCode uint32, current zhreader.PollResult, previous zhreader.PollResult, isFirstPoll bool) error {
+	// Create the request payload with only changed fields
 	request := MoneyDataRequest{
-		Seed:                     seed,
-		Timecode:                 int64(timeCode),
-		Money:                    pollResult.Money,
-		MoneyEarned:              pollResult.MoneyEarned,
-		UnitsBuilt:               pollResult.UnitsBuilt,
-		UnitsLost:                pollResult.UnitsLost,
-		BuildingsBuilt:           pollResult.BuildingsBuilt,
-		BuildingsLost:            pollResult.BuildingsLost,
-		BuildingsKilled:          pollResult.BuildingsKilled,
-		UnitsKilled:              pollResult.UnitsKilled,
-		GeneralsPointsTotal:      pollResult.GeneralsPointsTotal,
-		GeneralsPointsUsed:       pollResult.GeneralsPointsUsed,
-		RadarsBuilt:              pollResult.RadarsBuilt,
-		SearchAndDestroy:         pollResult.SearchAndDestroy,
-		HoldTheLine:              pollResult.HoldTheLine,
-		Bombardment:              pollResult.Bombardment,
-		XP:                       pollResult.XP,
-		XPLevel:                  pollResult.XPLevel,
-		TechBuildingsCaptured:    pollResult.TechBuildingsCaptured,
-		FactionBuildingsCaptured: pollResult.FactionBuildingsCaptured,
-		PowerTotal:               pollResult.PowerTotal,
-		PowerUsed:                pollResult.PowerUsed,
+		Seed:     seed,
+		Timecode: int64(timeCode),
+	}
+
+	// Only include fields that have changed (or on first poll, include all)
+	if isFirstPoll || current.Money != previous.Money {
+		request.Money = &current.Money
+	}
+	if isFirstPoll || current.MoneyEarned != previous.MoneyEarned {
+		request.MoneyEarned = &current.MoneyEarned
+	}
+	if isFirstPoll || current.UnitsBuilt != previous.UnitsBuilt {
+		request.UnitsBuilt = &current.UnitsBuilt
+	}
+	if isFirstPoll || current.UnitsLost != previous.UnitsLost {
+		request.UnitsLost = &current.UnitsLost
+	}
+	if isFirstPoll || current.BuildingsBuilt != previous.BuildingsBuilt {
+		request.BuildingsBuilt = &current.BuildingsBuilt
+	}
+	if isFirstPoll || current.BuildingsLost != previous.BuildingsLost {
+		request.BuildingsLost = &current.BuildingsLost
+	}
+	if isFirstPoll || current.BuildingsKilled != previous.BuildingsKilled {
+		request.BuildingsKilled = &current.BuildingsKilled
+	}
+	if isFirstPoll || current.UnitsKilled != previous.UnitsKilled {
+		request.UnitsKilled = &current.UnitsKilled
+	}
+	if isFirstPoll || current.GeneralsPointsTotal != previous.GeneralsPointsTotal {
+		request.GeneralsPointsTotal = &current.GeneralsPointsTotal
+	}
+	if isFirstPoll || current.GeneralsPointsUsed != previous.GeneralsPointsUsed {
+		request.GeneralsPointsUsed = &current.GeneralsPointsUsed
+	}
+	if isFirstPoll || current.RadarsBuilt != previous.RadarsBuilt {
+		request.RadarsBuilt = &current.RadarsBuilt
+	}
+	if isFirstPoll || current.SearchAndDestroy != previous.SearchAndDestroy {
+		request.SearchAndDestroy = &current.SearchAndDestroy
+	}
+	if isFirstPoll || current.HoldTheLine != previous.HoldTheLine {
+		request.HoldTheLine = &current.HoldTheLine
+	}
+	if isFirstPoll || current.Bombardment != previous.Bombardment {
+		request.Bombardment = &current.Bombardment
+	}
+	if isFirstPoll || current.XP != previous.XP {
+		request.XP = &current.XP
+	}
+	if isFirstPoll || current.XPLevel != previous.XPLevel {
+		request.XPLevel = &current.XPLevel
+	}
+	if isFirstPoll || current.TechBuildingsCaptured != previous.TechBuildingsCaptured {
+		request.TechBuildingsCaptured = &current.TechBuildingsCaptured
+	}
+	if isFirstPoll || current.FactionBuildingsCaptured != previous.FactionBuildingsCaptured {
+		request.FactionBuildingsCaptured = &current.FactionBuildingsCaptured
+	}
+	if isFirstPoll || current.PowerTotal != previous.PowerTotal {
+		request.PowerTotal = &current.PowerTotal
+	}
+	if isFirstPoll || current.PowerUsed != previous.PowerUsed {
+		request.PowerUsed = &current.PowerUsed
 	}
 
 	// Marshal to JSON
