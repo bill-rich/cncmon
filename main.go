@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,17 @@ func debugLog(format string, args ...interface{}) {
 	if debugEnabled {
 		fmt.Printf("DEBUG: "+format, args...)
 	}
+}
+
+// QueuedAPIRequest represents an API request that needs to be sent
+type QueuedAPIRequest struct {
+	APIURL      string
+	Seed        string
+	TimeCode    uint32
+	Current     zhreader.PollResult
+	Previous    zhreader.PollResult
+	IsFirstPoll bool
+	SuccessChan chan bool // Channel to signal success/failure
 }
 
 // EventData stores event information with money values for API transmission
@@ -281,16 +293,52 @@ func pollResultChanged(current, previous zhreader.PollResult) bool {
 	return false
 }
 
+// apiRequestWorker processes API requests from the queue
+func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := range requestQueue {
+		err := sendMoneyData(req.APIURL, req.Seed, req.TimeCode, req.Current, req.Previous, req.IsFirstPoll)
+		if err != nil {
+			fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
+			if req.SuccessChan != nil {
+				req.SuccessChan <- false
+			}
+		} else {
+			fmt.Println("Money data sent successfully")
+			if req.SuccessChan != nil {
+				req.SuccessChan <- true
+			}
+		}
+	}
+}
+
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
 func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string, sigChan <-chan os.Signal) int {
 	debugLog("Starting processMoneyMonitoring...\n")
 
 	// Initialize monitoring state
 	var lastSentPollResult zhreader.PollResult
+	var lastSentPollResultMutex sync.Mutex // Protect lastSentPollResult from race conditions
 	var lastTimecode uint32
 	eventCount := 0
+	var lastEventTimeMutex sync.Mutex
 	lastEventTime := time.Now()
 	firstPoll := true // Track if this is the first poll to initialize lastSentPollResult
+
+	// Create API request queue with buffer to prevent blocking
+	// Buffer size of 100 should be sufficient for most cases
+	requestQueue := make(chan QueuedAPIRequest, 100)
+	var wg sync.WaitGroup
+
+	// Start API request worker
+	wg.Add(1)
+	go apiRequestWorker(requestQueue, &wg)
+
+	// Ensure worker goroutine is cleaned up on exit
+	defer func() {
+		close(requestQueue)
+		wg.Wait()
+	}()
 
 	// Start polling timer
 	pollTicker := time.NewTicker(pollDelay)
@@ -357,7 +405,10 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 		// Check if any values in PollResult have changed
 		// On first poll, always send to initialize the baseline
-		valuesChanged := firstPoll || pollResultChanged(vals, lastSentPollResult)
+		lastSentPollResultMutex.Lock()
+		lastSentCopy := lastSentPollResult
+		lastSentPollResultMutex.Unlock()
+		valuesChanged := firstPoll || pollResultChanged(vals, lastSentCopy)
 
 		if valuesChanged {
 			// Convert PollResult to json and log only when values change
@@ -366,10 +417,10 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			eventCount++
 			isFirstPoll := firstPoll // Capture the flag before it's updated
 			if firstPoll {
-				fmt.Printf("Initial poll (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+				fmt.Printf("Initial poll (event %d) - queuing data (timecode: %d)...\n", eventCount, lastTimecode)
 				firstPoll = false
 			} else {
-				fmt.Printf("PollResult changed (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+				fmt.Printf("PollResult changed (event %d) - queuing data (timecode: %d)...\n", eventCount, lastTimecode)
 			}
 
 			// Determine seed to use for API calls
@@ -378,16 +429,37 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 				seedToUse = manualSeed
 			}
 
-			// Send money data via API (only changed fields will be included)
-			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals, lastSentPollResult, isFirstPoll)
-			if err != nil {
-				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
-				// Don't update lastSentPollResult if send failed
-			} else {
-				fmt.Println("Money data sent successfully")
-				// Update last sent PollResult only after successful send
-				lastSentPollResult = vals
-				lastEventTime = time.Now()
+			// Create success channel to track API call result
+			successChan := make(chan bool, 1)
+
+			// Queue the API request (non-blocking if buffer has space)
+			select {
+			case requestQueue <- QueuedAPIRequest{
+				APIURL:      apiURL,
+				Seed:        seedToUse,
+				TimeCode:    lastTimecode,
+				Current:     vals,
+				Previous:    lastSentCopy,
+				IsFirstPoll: isFirstPoll,
+				SuccessChan: successChan,
+			}:
+				// Request queued successfully
+				// Handle success/failure asynchronously
+				go func(currentVals zhreader.PollResult) {
+					success := <-successChan
+					if success {
+						// Update last sent PollResult only after successful send
+						lastSentPollResultMutex.Lock()
+						lastSentPollResult = currentVals
+						lastSentPollResultMutex.Unlock()
+						lastEventTimeMutex.Lock()
+						lastEventTime = time.Now()
+						lastEventTimeMutex.Unlock()
+					}
+				}(vals)
+			default:
+				// Queue is full - log warning but continue polling
+				fmt.Printf("Warning: API request queue is full, dropping request (event %d)\n", eventCount)
 			}
 
 			// Display memory values
@@ -398,7 +470,9 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 		}
 
 		// Check for timeout due to inactivity
+		lastEventTimeMutex.Lock()
 		timeSinceLastEvent := time.Since(lastEventTime)
+		lastEventTimeMutex.Unlock()
 		if timeSinceLastEvent > timeout {
 			fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
 			return eventCount
