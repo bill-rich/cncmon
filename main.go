@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -119,7 +120,7 @@ func main() {
 		fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
 
 		// Process money monitoring until completion or timeout
-		eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed)
+		eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed, sigChan)
 
 		fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
 		memReader.Close()
@@ -203,7 +204,7 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 }
 
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
-func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
+func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string, sigChan <-chan os.Signal) int {
 	debugLog("Starting processMoneyMonitoring...\n")
 
 	// Initialize monitoring state
@@ -213,14 +214,15 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 	lastEventTime := time.Now()
 
 	// Start polling timer
-	pollTicker := time.NewTicker(pollDelay * time.Millisecond)
+	pollTicker := time.NewTicker(pollDelay)
 	defer pollTicker.Stop()
 
-	fmt.Printf("Starting money monitoring (polling every 500ms)...\n")
+	fmt.Printf("Starting money monitoring (polling every %v)...\n", pollDelay)
 	loopCount := 0
 	startTime := time.Now()
 
 	for {
+		log.Printf("Money monitoring: iteration %d, events: %d", loopCount, eventCount)
 		loopCount++
 		if loopCount%20 == 0 { // Log every 10 seconds (20 * 500ms)
 			fmt.Printf("Money monitoring: iteration %d, events: %d\n", loopCount, eventCount)
@@ -231,10 +233,20 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			fmt.Printf("No money changes detected after 30 seconds, this might indicate an issue\n")
 		}
 
-		<-pollTicker.C
+		log.Printf("Money monitoring: waiting for poll ticker")
+		// Use select to check for signals while waiting for ticker
+		select {
+		case <-sigChan:
+			fmt.Printf("\nReceived interrupt signal. Shutting down gracefully...\n")
+			panic("received interrupt signal")
+		case <-pollTicker.C:
+			log.Printf("Money monitoring: poll ticker received")
+		}
 		// Poll memory for money values
 		vals := memReader.Poll()
-		debugLog("Memory poll completed, got values: %v\n", vals)
+		// Convert PollResult to json and log
+		valsJSON, _ := json.Marshal(vals)
+		log.Printf("Memory poll completed, got values: %s", string(valsJSON))
 
 		// Check if all values are -1, which indicates the process may have gone away
 		allInvalid := true

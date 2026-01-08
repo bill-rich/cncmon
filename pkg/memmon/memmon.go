@@ -29,7 +29,7 @@ var (
 
 const unitsBuiltInitialAddr = 0x0062B688
 
-var playerOffsets = [9]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38, 0x3C}
+var playerOffsets = [8]uint32{0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30, 0x34, 0x38}
 
 const (
 	PROCESS_VM_READ           = 0x0010
@@ -181,18 +181,18 @@ func (r *Reader) pollForAllPlayers(initialAddr uintptr, offsets ...uint32) [8]in
 	for i := range out {
 		out[i] = -1
 	}
-	for playerOffset := range playerOffsets {
+	for i, playerOffset := range playerOffsets {
 		val, ok := r.ReadPointerChain(r.initialAddr, append([]uint32{uint32(playerOffset)}, offsets...)...)
 		if !ok {
-			out[playerOffset] = -1
+			out[i] = -1
 			continue
 		}
-		out[playerOffset] = int32(val)
+		out[i] = int32(val)
 	}
 	return out
 }
 
-func (r *Reader) pollPlayerMoney(playerOffsets [9]uint32) [8]int32 {
+func (r *Reader) pollPlayerMoney(playerOffsets [8]uint32) [8]int32 {
 	// Find initial address using AOB search if not already found
 	if !r.initialFound {
 		log.Printf("AOB Search: Starting pattern search for initial address...")
@@ -209,8 +209,8 @@ func (r *Reader) pollPlayerMoney(playerOffsets [9]uint32) [8]int32 {
 	}
 
 	// Read all 9 values first using ReadPointerChain
-	var tempValues [9]int32
-	for i := 0; i < 9; i++ {
+	var tempValues [8]int32
+	for i := 0; i < 8; i++ {
 		val, ok := r.ReadPointerChain(r.initialAddr, playerOffsets[i], 0x38)
 		if !ok {
 			tempValues[i] = -1
@@ -222,7 +222,7 @@ func (r *Reader) pollPlayerMoney(playerOffsets [9]uint32) [8]int32 {
 
 	// Find the last positive value and replace it and following zeros with -1
 	lastPositiveIndex := -1
-	for i := 0; i < 9; i++ {
+	for i := 0; i < 8; i++ {
 		if tempValues[i] > 0 {
 			lastPositiveIndex = i
 		}
@@ -230,7 +230,7 @@ func (r *Reader) pollPlayerMoney(playerOffsets [9]uint32) [8]int32 {
 
 	// Replace the last positive value and any following zeros with -1
 	if lastPositiveIndex >= 0 {
-		for i := lastPositiveIndex; i < 9; i++ {
+		for i := lastPositiveIndex; i < 8; i++ {
 			if tempValues[i] == 0 {
 				tempValues[i] = -1
 			}
