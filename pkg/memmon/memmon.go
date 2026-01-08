@@ -160,18 +160,18 @@ func (r *Reader) Poll() PollResult {
 		PowerTotal:               r.pollForAllPlayers(unitsBuiltInitialAddr, 0x84),
 		PowerUsed:                r.pollForAllPlayers(unitsBuiltInitialAddr, 0x88),
 	}
-	log.Printf("PollResult: %v", result)
+	testres := r.pollForAllPlayers(unitsBuiltInitialAddr, 0x298)
+	log.Printf("BILL - testres: %v", testres)
 	return result
 }
 
 func (r *Reader) PollForAllPlayersArray(initialAddr uintptr, finalOffset uint32, offsets ...uint32) [8][8]int32 {
 	out := [8][8]int32{}
-	for n, playerOffset := range playerOffsets {
-		for i := 0; i < 8; i++ {
-			adjustedFinalOffset := finalOffset + uint32(4*i)
-			newOffsets := append(offsets, adjustedFinalOffset)
-			out[n] = r.pollForAllPlayers(initialAddr, append([]uint32{uint32(playerOffset)}, newOffsets...)...)
-		}
+	for i, _ := range playerOffsets {
+		adjustment := 4 * i
+		adjustedFinalOffset := finalOffset + uint32(adjustment)
+		newOffsets := append(offsets, adjustedFinalOffset)
+		out[i] = r.pollForAllPlayers(initialAddr, newOffsets...)
 	}
 	return out
 }

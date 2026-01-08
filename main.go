@@ -203,15 +203,83 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 	}
 }
 
+// pollResultChanged checks if any field in the PollResult has changed compared to the previous one
+func pollResultChanged(current, previous zhreader.PollResult) bool {
+	// Compare all array fields
+	if current.Money != previous.Money {
+		return true
+	}
+	if current.MoneyEarned != previous.MoneyEarned {
+		return true
+	}
+	if current.UnitsBuilt != previous.UnitsBuilt {
+		return true
+	}
+	if current.UnitsLost != previous.UnitsLost {
+		return true
+	}
+	if current.BuildingsBuilt != previous.BuildingsBuilt {
+		return true
+	}
+	if current.BuildingsLost != previous.BuildingsLost {
+		return true
+	}
+	if current.PowerTotal != previous.PowerTotal {
+		return true
+	}
+	if current.PowerUsed != previous.PowerUsed {
+		return true
+	}
+	if current.RadarsBuilt != previous.RadarsBuilt {
+		return true
+	}
+	if current.SearchAndDestroy != previous.SearchAndDestroy {
+		return true
+	}
+	if current.HoldTheLine != previous.HoldTheLine {
+		return true
+	}
+	if current.Bombardment != previous.Bombardment {
+		return true
+	}
+	if current.XP != previous.XP {
+		return true
+	}
+	if current.XPLevel != previous.XPLevel {
+		return true
+	}
+	if current.GeneralsPointsUsed != previous.GeneralsPointsUsed {
+		return true
+	}
+	if current.GeneralsPointsTotal != previous.GeneralsPointsTotal {
+		return true
+	}
+	if current.TechBuildingsCaptured != previous.TechBuildingsCaptured {
+		return true
+	}
+	if current.FactionBuildingsCaptured != previous.FactionBuildingsCaptured {
+		return true
+	}
+	// Compare 2D arrays
+	if current.UnitsKilled != previous.UnitsKilled {
+		return true
+	}
+	if current.BuildingsKilled != previous.BuildingsKilled {
+		return true
+	}
+	return false
+}
+
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
 func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string, sigChan <-chan os.Signal) int {
 	debugLog("Starting processMoneyMonitoring...\n")
 
 	// Initialize monitoring state
-	var lastMoneyValues [8]int32
+	var lastSentPollResult zhreader.PollResult
 	var lastTimecode uint32
 	eventCount := 0
 	lastEventTime := time.Now()
+	firstPoll := true // Track if this is the first poll to initialize lastSentPollResult
 
 	// Start polling timer
 	pollTicker := time.NewTicker(pollDelay)
@@ -272,18 +340,18 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			debugLog("Current timecode: %d\n", currentTimecode)
 		}
 
-		// Check if money values have changed
-		moneyChanged := false
-		for i, val := range vals.Money {
-			if val != lastMoneyValues[i] {
-				moneyChanged = true
-				break
-			}
-		}
+		// Check if any values in PollResult have changed
+		// On first poll, always send to initialize the baseline
+		valuesChanged := firstPoll || pollResultChanged(vals, lastSentPollResult)
 
-		if moneyChanged {
+		if valuesChanged {
 			eventCount++
-			fmt.Printf("Money changed (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+			if firstPoll {
+				fmt.Printf("Initial poll (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+				firstPoll = false
+			} else {
+				fmt.Printf("PollResult changed (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+			}
 
 			// Determine seed to use for API calls
 			seedToUse := memReader.GetSeed()
@@ -295,8 +363,12 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals)
 			if err != nil {
 				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
+				// Don't update lastSentPollResult if send failed
 			} else {
 				fmt.Println("Money data sent successfully")
+				// Update last sent PollResult only after successful send
+				lastSentPollResult = vals
+				lastEventTime = time.Now()
 			}
 
 			// Display memory values
@@ -304,10 +376,6 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 				P [8]int32 `json:"p"`
 			}{vals.Money})
 			fmt.Printf("Memory values: %s\n", string(j))
-
-			// Update last known values
-			lastMoneyValues = vals.Money
-			lastEventTime = time.Now()
 		}
 
 		// Check for timeout due to inactivity
