@@ -323,9 +323,6 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 		}
 		// Poll memory for money values
 		vals := memReader.Poll()
-		// Convert PollResult to json and log
-		valsJSON, _ := json.Marshal(vals)
-		log.Printf("Memory poll completed, got values: %s", string(valsJSON))
 
 		// Check if all values are -1, which indicates the process may have gone away
 		allInvalid := true
@@ -363,6 +360,9 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 		valuesChanged := firstPoll || pollResultChanged(vals, lastSentPollResult)
 
 		if valuesChanged {
+			// Convert PollResult to json and log only when values change
+			valsJSON, _ := json.Marshal(vals)
+			log.Printf("Memory poll completed, got values: %s", string(valsJSON))
 			eventCount++
 			isFirstPoll := firstPoll // Capture the flag before it's updated
 			if firstPoll {
