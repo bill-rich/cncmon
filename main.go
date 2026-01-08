@@ -280,7 +280,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			}
 
 			// Send money data via API
-			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals.Money)
+			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals)
 			if err != nil {
 				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
 			} else {
@@ -309,32 +309,56 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 // MoneyDataRequest represents the API request for player money data
 type MoneyDataRequest struct {
-	Seed         string `json:"seed"`
-	Timecode     int64  `json:"timecode"`
-	Player1Money int64  `json:"player_1_money"`
-	Player2Money int64  `json:"player_2_money"`
-	Player3Money int64  `json:"player_3_money"`
-	Player4Money int64  `json:"player_4_money"`
-	Player5Money int64  `json:"player_5_money"`
-	Player6Money int64  `json:"player_6_money"`
-	Player7Money int64  `json:"player_7_money"`
-	Player8Money int64  `json:"player_8_money"`
+	Seed                     string      `json:"seed"`
+	Timecode                 int64       `json:"timecode"`
+	Money                    [8]int32    `json:"money"`
+	MoneyEarned              [8]int32    `json:"money_earned"`
+	UnitsBuilt               [8]int32    `json:"units_built"`
+	UnitsLost                [8]int32    `json:"units_lost"`
+	BuildingsBuilt           [8]int32    `json:"buildings_built"`
+	BuildingsLost            [8]int32    `json:"buildings_lost"`
+	BuildingsKilled          [8][8]int32 `json:"buildings_killed"`
+	UnitsKilled              [8][8]int32 `json:"units_killed"`
+	GeneralsPointsTotal      [8]int32    `json:"generals_points_total"`
+	GeneralsPointsUsed       [8]int32    `json:"generals_points_used"`
+	RadarsBuilt              [8]int32    `json:"radars_built"`
+	SearchAndDestroy         [8]int32    `json:"search_and_destroy"`
+	HoldTheLine              [8]int32    `json:"hold_the_line"`
+	Bombardment              [8]int32    `json:"bombardment"`
+	XP                       [8]int32    `json:"xp"`
+	XPLevel                  [8]int32    `json:"xp_level"`
+	TechBuildingsCaptured    [8]int32    `json:"tech_buildings_captured"`
+	FactionBuildingsCaptured [8]int32    `json:"faction_buildings_captured"`
+	PowerTotal               [8]int32    `json:"power_total"`
+	PowerUsed                [8]int32    `json:"power_used"`
 }
 
 // sendMoneyData sends player money data to the API endpoint
-func sendMoneyData(apiURL string, seed string, timeCode uint32, playerMoney [8]int32) error {
-	// Create the request payload
+func sendMoneyData(apiURL string, seed string, timeCode uint32, pollResult zhreader.PollResult) error {
+	// Create the request payload with all pollresult data
 	request := MoneyDataRequest{
-		Seed:         seed,
-		Timecode:     int64(timeCode),
-		Player1Money: int64(playerMoney[0]),
-		Player2Money: int64(playerMoney[1]),
-		Player3Money: int64(playerMoney[2]),
-		Player4Money: int64(playerMoney[3]),
-		Player5Money: int64(playerMoney[4]),
-		Player6Money: int64(playerMoney[5]),
-		Player7Money: int64(playerMoney[6]),
-		Player8Money: int64(playerMoney[7]),
+		Seed:                     seed,
+		Timecode:                 int64(timeCode),
+		Money:                    pollResult.Money,
+		MoneyEarned:              pollResult.MoneyEarned,
+		UnitsBuilt:               pollResult.UnitsBuilt,
+		UnitsLost:                pollResult.UnitsLost,
+		BuildingsBuilt:           pollResult.BuildingsBuilt,
+		BuildingsLost:            pollResult.BuildingsLost,
+		BuildingsKilled:          pollResult.BuildingsKilled,
+		UnitsKilled:              pollResult.UnitsKilled,
+		GeneralsPointsTotal:      pollResult.GeneralsPointsTotal,
+		GeneralsPointsUsed:       pollResult.GeneralsPointsUsed,
+		RadarsBuilt:              pollResult.RadarsBuilt,
+		SearchAndDestroy:         pollResult.SearchAndDestroy,
+		HoldTheLine:              pollResult.HoldTheLine,
+		Bombardment:              pollResult.Bombardment,
+		XP:                       pollResult.XP,
+		XPLevel:                  pollResult.XPLevel,
+		TechBuildingsCaptured:    pollResult.TechBuildingsCaptured,
+		FactionBuildingsCaptured: pollResult.FactionBuildingsCaptured,
+		PowerTotal:               pollResult.PowerTotal,
+		PowerUsed:                pollResult.PowerUsed,
 	}
 
 	// Marshal to JSON
