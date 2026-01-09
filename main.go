@@ -327,7 +327,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 	// Create API request queue with buffer to prevent blocking
 	// Buffer size of 100 should be sufficient for most cases
-	requestQueue := make(chan QueuedAPIRequest, 100)
+	requestQueue := make(chan QueuedAPIRequest, 10000)
 	var wg sync.WaitGroup
 
 	// Start API request worker
