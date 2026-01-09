@@ -2,19 +2,19 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
 	zhreader "github.com/bill-rich/cncmon/pkg/memmon"
-	"github.com/bill-rich/cncstats/pkg/zhreplay"
 )
 
 var debugEnabled bool
@@ -23,6 +23,17 @@ func debugLog(format string, args ...interface{}) {
 	if debugEnabled {
 		fmt.Printf("DEBUG: "+format, args...)
 	}
+}
+
+// QueuedAPIRequest represents an API request that needs to be sent
+type QueuedAPIRequest struct {
+	APIURL      string
+	Seed        string
+	TimeCode    uint32
+	Current     zhreader.PollResult
+	Previous    zhreader.PollResult
+	IsFirstPoll bool
+	SuccessChan chan bool // Channel to signal success/failure
 }
 
 // EventData stores event information with money values for API transmission
@@ -55,14 +66,14 @@ func main() {
 
 	// Parse command line arguments
 	var (
-		replayFile  = flag.String("file", defaultReplayFile, "Replay file to monitor")
-		pollDelay   = flag.Duration("delay", 50*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
-		timeout     = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
-		apiURL      = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
-		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
-		testMode    = flag.Bool("test", false, "Test mode: process existing file immediately without waiting for file activity")
-		help        = flag.Bool("help", false, "Show help information")
-		seed        = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
+		replayFile   = flag.String("file", defaultReplayFile, "Replay file to monitor")
+		pollDelay    = flag.Duration("delay", 50*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
+		timeout      = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
+		apiURL       = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
+		processName  = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
+		help         = flag.Bool("help", false, "Show help information")
+		seed         = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
+		apiQueueSize = flag.Int("api-queue-size", 1000, "Size of the API request queue buffer (default: 1000)")
 
 		// File search flags
 		searchFile    = flag.String("search-file", "", "Search for patterns in a static executable file")
@@ -112,32 +123,22 @@ func main() {
 			return
 		}
 
-		if *testMode {
-			// Test mode: process file immediately
-			fmt.Printf("Test mode: Processing existing replay file immediately...\n")
-			eventCount := processReplayFile(*replayFile, memReader, *pollDelay, *timeout, *apiURL, *seed)
-			fmt.Printf("Replay processing completed. Processed %d events.\n", eventCount)
+		// Production mode: wait for timecode to start increasing
+		if !waitForTimecodeStart(memReader, sigChan) {
 			memReader.Close()
-			fmt.Println("Test mode complete. Exiting.")
+			fmt.Println("Timecode monitoring interrupted. Exiting.")
 			return
-		} else {
-			// Production mode: wait for timecode to start increasing
-			if !waitForTimecodeStart(memReader, sigChan) {
-				memReader.Close()
-				fmt.Println("Timecode monitoring interrupted. Exiting.")
-				return
-			}
-
-			fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
-
-			// Process money monitoring until completion or timeout
-			eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed)
-
-			fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
-			memReader.Close()
-			fmt.Println("Returning to waiting mode for next game...")
-			fmt.Println()
 		}
+
+		fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
+
+		// Process money monitoring until completion or timeout
+		eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed, *apiQueueSize, sigChan)
+
+		fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
+		memReader.Close()
+		fmt.Println("Returning to waiting mode for next game...")
+		fmt.Println()
 	}
 }
 
@@ -171,8 +172,8 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 	fmt.Println("Waiting for timecode to start increasing (game start)...")
 
 	var lastTimecode uint32 = 0
-	var stableCount int = 0
-	const requiredStableReads = 3 // Need 3 consecutive reads of the same timecode to consider it stable
+	var increaseCount int = 0
+	const requiredIncreases = 3 // Need 3 consecutive increases to consider the game started
 
 	for {
 		// Check for interrupt signals
@@ -192,315 +193,158 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 			continue
 		}
 
-		// Check if timecode is increasing
-		if currentTimecode > lastTimecode {
-			fmt.Printf("Timecode increased from %d to %d - game started!\n", lastTimecode, currentTimecode)
-			return true
-		}
-
-		// Check if timecode is stable (not changing)
-		if currentTimecode == lastTimecode && currentTimecode > 0 {
-			stableCount++
-			if stableCount >= requiredStableReads {
-				fmt.Printf("Timecode stable at %d for %d reads - game may have started\n", currentTimecode, stableCount)
-				return true
+		// Only start once we've seen requiredIncreases consecutive increases in timecode.
+		if lastTimecode != 0 {
+			if currentTimecode > lastTimecode {
+				increaseCount++
+				fmt.Printf("Timecode increased from %d to %d (%d/%d consecutive increases)\n",
+					lastTimecode, currentTimecode, increaseCount, requiredIncreases)
+				if increaseCount >= requiredIncreases {
+					// Check money values - don't start if they match the default/initial state
+					pollResult := memReader.Poll()
+					expectedMoney := [8]int32{10000, 10000, 10000, 10000, 10000, 10000, 10000, -1}
+					if pollResult.Money == expectedMoney {
+						fmt.Printf("Money values match default state [10000, 10000, 10000, 10000, 10000, 10000, 10000, -1] - not starting monitoring, resetting detection\n")
+						increaseCount = 0
+						lastTimecode = 0 // Reset to start fresh
+						continue
+					}
+					fmt.Printf("Timecode has increased %d times consecutively - game started!\n", requiredIncreases)
+					return true
+				}
+			} else if currentTimecode < lastTimecode {
+				// Timecode went backwards – reset detection and wait for a fresh sequence
+				fmt.Printf("Timecode decreased from %d to %d - resetting start detection and waiting for new game...\n",
+					lastTimecode, currentTimecode)
+				increaseCount = 0
 			}
-		} else {
-			stableCount = 0
+			// If equal, do nothing special – just keep waiting
 		}
 
 		lastTimecode = currentTimecode
-		fmt.Printf("Current timecode: %d (waiting for increase...)\n", currentTimecode)
+		fmt.Printf("Current timecode: %d (waiting for %d consecutive increases...)\n", currentTimecode, requiredIncreases)
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-// processReplayFile processes a replay file until completion or timeout
-func processReplayFile(replayFile string, memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
-	debugLog("Starting processReplayFile for: %s\n", replayFile)
-
-	// Create context with a much longer timeout to allow for real-time streaming
-	// The cncstats library will handle the actual timeout for new data
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	// Configure streaming options for better real-time monitoring
-	options := &zhreplay.StreamReplayOptions{
-		PollInterval:      pollDelay * time.Millisecond, // Check more frequently for new data
-		MaxWaitTime:       30 * time.Second,             // Max wait for individual operations
-		InactivityTimeout: timeout,                      // Use our timeout for inactivity (2 minutes default)
-		BufferSize:        100,
+// pollResultChanged checks if any field in the PollResult has changed compared to the previous one
+func pollResultChanged(current, previous zhreader.PollResult) bool {
+	// Compare all array fields
+	if current.Money != previous.Money {
+		return true
 	}
+	if current.MoneyEarned != previous.MoneyEarned {
+		return true
+	}
+	if current.UnitsBuilt != previous.UnitsBuilt {
+		return true
+	}
+	if current.UnitsLost != previous.UnitsLost {
+		return true
+	}
+	if current.BuildingsBuilt != previous.BuildingsBuilt {
+		return true
+	}
+	if current.BuildingsLost != previous.BuildingsLost {
+		return true
+	}
+	if current.PowerTotal != previous.PowerTotal {
+		return true
+	}
+	if current.PowerUsed != previous.PowerUsed {
+		return true
+	}
+	if current.RadarsBuilt != previous.RadarsBuilt {
+		return true
+	}
+	if current.SearchAndDestroy != previous.SearchAndDestroy {
+		return true
+	}
+	if current.HoldTheLine != previous.HoldTheLine {
+		return true
+	}
+	if current.Bombardment != previous.Bombardment {
+		return true
+	}
+	if current.XP != previous.XP {
+		return true
+	}
+	if current.XPLevel != previous.XPLevel {
+		return true
+	}
+	if current.GeneralsPointsUsed != previous.GeneralsPointsUsed {
+		return true
+	}
+	if current.GeneralsPointsTotal != previous.GeneralsPointsTotal {
+		return true
+	}
+	if current.TechBuildingsCaptured != previous.TechBuildingsCaptured {
+		return true
+	}
+	if current.FactionBuildingsCaptured != previous.FactionBuildingsCaptured {
+		return true
+	}
+	// Compare 2D arrays
+	if current.UnitsKilled != previous.UnitsKilled {
+		return true
+	}
+	if current.BuildingsKilled != previous.BuildingsKilled {
+		return true
+	}
+	return false
+}
 
-	fmt.Printf("DEBUG: Waiting 5 seconds for seed to be written...\n")
-	// Give it some time to write the seed
-	time.Sleep(5 * time.Second)
-
-	// Start streaming replay events
-	fmt.Println("DEBUG: Starting replay streaming with real-time monitoring...")
-
-	// Try to get the streaming replay with retries
-	var streamingReplay *zhreplay.StreamingReplay
-	var err error
-	maxRetries := 10
-	retryCount := 0
-
-	for retryCount < maxRetries {
-		fmt.Printf("DEBUG: Attempt %d/%d to start streaming...\n", retryCount+1, maxRetries)
-
-		_, streamingReplay, err = zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
+// apiRequestWorker processes API requests from the queue
+func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := range requestQueue {
+		err := sendMoneyData(req.APIURL, req.Seed, req.TimeCode, req.Current, req.Previous, req.IsFirstPoll)
 		if err != nil {
-			fmt.Printf("DEBUG: Failed to start streaming (attempt %d): %v\n", retryCount+1, err)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		if streamingReplay == nil {
-			fmt.Printf("DEBUG: StreamingReplay is nil (attempt %d)\n", retryCount+1)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		if streamingReplay.Header == nil {
-			fmt.Printf("DEBUG: Header is nil (attempt %d)\n", retryCount+1)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		if streamingReplay.Header.Metadata.Seed == "" {
-			fmt.Printf("DEBUG: Replay seed not yet available (attempt %d). Waiting...\n", retryCount+1)
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		fmt.Printf("DEBUG: Successfully got streaming replay with seed: %s\n", streamingReplay.Header.Metadata.Seed)
-		break
-	}
-
-	if retryCount >= maxRetries {
-		fmt.Printf("ERROR: Failed to start streaming after %d attempts\n", maxRetries)
-		return 0
-	}
-
-	fmt.Printf("DEBUG: Starting main streaming loop...\n")
-	bodyChan, streamingReplay, err := zhreplay.StreamReplay(ctx, replayFile, nil, nil, nil, options)
-	if err != nil {
-		fmt.Printf("ERROR: Failed to start main streaming: %v\n", err)
-		return 0
-	}
-
-	if bodyChan == nil {
-		fmt.Printf("ERROR: bodyChan is nil\n")
-		return 0
-	}
-
-	fmt.Printf("DEBUG: Successfully started streaming, bodyChan created\n")
-
-	// Determine seed to use
-	var seed string
-	if manualSeed != "" {
-		seed = manualSeed
-		fmt.Printf("Using manual seed: %s\n", seed)
-	} else {
-		seed = streamingReplay.Header.Metadata.Seed
-		fmt.Printf("Replay Seed: %s\n", seed)
-	}
-
-	// Initialize replay session data
-	session := &ReplaySession{
-		Seed:       seed,
-		Events:     make([]EventData, 0),
-		EventCount: 0,
-	}
-
-	// Print header information
-	fmt.Printf("Replay Header:\n")
-	fmt.Printf("  Map: %s\n", streamingReplay.Header.Metadata.MapFile)
-	fmt.Printf("  Players: %d\n", len(streamingReplay.Header.Metadata.Players))
-	for i, player := range streamingReplay.Header.Metadata.Players {
-		fmt.Printf("    Player %d: %s (Team %s)\n", i+1, player.Name, player.Team)
-	}
-	fmt.Println()
-
-	// Initialize polling state
-	var lastMoneyValues [8]int32
-	var lastTimeCode uint32
-	var timeCodeIncrement uint32
-	eventCount := 0
-	lastEventTime := time.Now()
-
-	// Start 50ms polling timer
-	pollTicker := time.NewTicker(pollDelay * time.Millisecond)
-	defer pollTicker.Stop()
-
-	fmt.Printf("DEBUG: Starting main event loop...\n")
-	loopCount := 0
-	startTime := time.Now()
-	maxWaitTime := 30 * time.Second // Maximum time to wait for events
-
-	for {
-		loopCount++
-		if loopCount%100 == 0 {
-			fmt.Printf("DEBUG: Main loop iteration %d, waiting for events...\n", loopCount)
-		}
-
-		// Check if we've been waiting too long without any events
-		if time.Since(startTime) > maxWaitTime && eventCount == 0 {
-			fmt.Printf("DEBUG: No events received after %v, this might indicate an issue\n", maxWaitTime)
-			fmt.Printf("DEBUG: File size: %d bytes, last modified: %v\n",
-				func() int64 {
-					if info, err := os.Stat(replayFile); err == nil {
-						return info.Size()
-					}
-					return -1
-				}(),
-				func() time.Time {
-					if info, err := os.Stat(replayFile); err == nil {
-						return info.ModTime()
-					}
-					return time.Time{}
-				}())
-		}
-
-		select {
-		case chunk, ok := <-bodyChan:
-			fmt.Printf("DEBUG: Received chunk from bodyChan (ok=%v)\n", ok)
-			if !ok {
-				fmt.Printf("\nStreaming completed (channel closed). Processed %d events.\n", eventCount)
-				fmt.Println("This could mean:")
-				fmt.Println("  - EndReplay command was received")
-				fmt.Println("  - File reached end and no new data for 2 minutes")
-				fmt.Println("  - Context was cancelled")
-				return eventCount
+			fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
+			if req.SuccessChan != nil {
+				req.SuccessChan <- false
 			}
-
-			// Get timecode from memory using binary search instead of replay file
-			memoryTimecode, err := memReader.GetTimecode()
-			if err != nil {
-				fmt.Printf("Warning: Failed to get timecode from memory: %v\n", err)
-				// Fall back to replay file timecode if memory timecode fails
-				lastTimeCode = uint32(chunk.TimeCode)
-			} else {
-				lastTimeCode = memoryTimecode
-				fmt.Printf("Memory Timecode: %d (from binary search)\n", memoryTimecode)
+		} else {
+			fmt.Println("Money data sent successfully")
+			if req.SuccessChan != nil {
+				req.SuccessChan <- true
 			}
-			timeCodeIncrement = 0 // Reset increment when we get a new replay event
-			lastEventTime = time.Now()
-			eventCount++
-
-			// Print replay event information (for debugging)
-			fmt.Printf("Replay Event: Time=%d, Order=%s, PlayerID=%d", chunk.TimeCode, chunk.OrderName, chunk.PlayerID)
-			if chunk.PlayerName != "" {
-				fmt.Printf(", Player=%s", chunk.PlayerName)
-			}
-			fmt.Println()
-
-			// Check for EndReplay command
-			if chunk.OrderCode == 27 {
-				fmt.Println("EndReplay command detected - streaming will stop.")
-				return eventCount
-			}
-
-		case <-pollTicker.C:
-			fmt.Printf("DEBUG: Poll ticker fired, polling memory...\n")
-			// Poll memory every 50ms
-			vals := memReader.Poll()
-			fmt.Printf("DEBUG: Memory poll completed, got values: %v\n", vals)
-
-			// Check if all values are -1, which indicates the process may have gone away
-			allInvalid := true
-			for _, val := range vals {
-				if val != -1 {
-					allInvalid = false
-					break
-				}
-			}
-			if allInvalid {
-				fmt.Println("  Warning: All memory values are invalid. Generals.exe process may have gone away.")
-				fmt.Println("  Returning to process monitoring...")
-				return eventCount
-			}
-
-			// Check if money values have changed
-			moneyChanged := false
-			for i, val := range vals {
-				if val != lastMoneyValues[i] {
-					moneyChanged = true
-					break
-				}
-			}
-
-			if moneyChanged {
-				// Get current timecode from memory using binary search
-				currentTimecode, err := memReader.GetTimecode()
-				if err != nil {
-					fmt.Printf("  Warning: Failed to get timecode from memory: %v\n", err)
-					// Use last known timecode with increment as fallback
-					if timeCodeIncrement > 0 {
-						timeCodeIncrement++
-					} else {
-						timeCodeIncrement = 1
-					}
-					currentTimecode = lastTimeCode + timeCodeIncrement
-				} else {
-					// Use the current timecode from memory
-					lastTimeCode = currentTimecode
-					timeCodeIncrement = 0 // Reset increment when we get a new timecode from memory
-				}
-
-				// Send money data via API with current timecode
-				fmt.Printf("  Money changed - sending data (timecode: %d)...\n", currentTimecode)
-				err = sendMoneyData(apiURL, session.Seed, currentTimecode, vals)
-				if err != nil {
-					fmt.Printf("  Warning: Failed to send money data via API: %v\n", err)
-				} else {
-					fmt.Println("  Money data sent successfully")
-				}
-
-				// Display memory values
-				j, _ := json.Marshal(struct {
-					P [8]int32 `json:"p"`
-				}{vals})
-				fmt.Printf("  Memory values: %s\n", string(j))
-
-				// Update last known values
-				lastMoneyValues = vals
-			}
-
-		case <-ctx.Done():
-			fmt.Printf("DEBUG: Context done signal received\n")
-			// Check if we timed out due to inactivity
-			timeSinceLastEvent := time.Since(lastEventTime)
-			fmt.Printf("DEBUG: Time since last event: %v, timeout: %v\n", timeSinceLastEvent, timeout)
-			if timeSinceLastEvent > timeout {
-				fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
-			} else {
-				fmt.Printf("\nContext cancelled. Processed %d events before timeout.\n", eventCount)
-			}
-			return eventCount
 		}
 	}
 }
 
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
-func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string) int {
+func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string, apiQueueSize int, sigChan <-chan os.Signal) int {
 	debugLog("Starting processMoneyMonitoring...\n")
 
 	// Initialize monitoring state
-	var lastMoneyValues [8]int32
+	var lastSentPollResult zhreader.PollResult
+	var lastSentPollResultMutex sync.Mutex     // Protect lastSentPollResult from race conditions
+	var lastSeenPollResult zhreader.PollResult // Track last poll result we saw (for change detection)
 	var lastTimecode uint32
 	eventCount := 0
-	lastEventTime := time.Now()
+	var lastEventTimeMutex sync.Mutex
+	firstPoll := true // Track if this is the first poll to initialize lastSentPollResult
+
+	// Create API request queue with buffer to prevent blocking
+	requestQueue := make(chan QueuedAPIRequest, apiQueueSize)
+	var wg sync.WaitGroup
+
+	// Start API request worker
+	wg.Add(1)
+	go apiRequestWorker(requestQueue, &wg)
+
+	// Ensure worker goroutine is cleaned up on exit
+	defer func() {
+		close(requestQueue)
+		wg.Wait()
+	}()
 
 	// Start polling timer
-	pollTicker := time.NewTicker(pollDelay * time.Millisecond)
+	pollTicker := time.NewTicker(pollDelay)
 	defer pollTicker.Stop()
 
-	fmt.Printf("Starting money monitoring (polling every 500ms)...\n")
+	fmt.Printf("Starting money monitoring (polling every %v)...\n", pollDelay)
 	loopCount := 0
 	startTime := time.Now()
 
@@ -515,14 +359,19 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			fmt.Printf("No money changes detected after 30 seconds, this might indicate an issue\n")
 		}
 
-		<-pollTicker.C
+		// Use select to check for signals while waiting for ticker
+		select {
+		case <-sigChan:
+			fmt.Printf("\nReceived interrupt signal. Shutting down gracefully...\n")
+			panic("received interrupt signal")
+		case <-pollTicker.C:
+		}
 		// Poll memory for money values
 		vals := memReader.Poll()
-		debugLog("Memory poll completed, got values: %v\n", vals)
 
 		// Check if all values are -1, which indicates the process may have gone away
 		allInvalid := true
-		for _, val := range vals {
+		for _, val := range vals.Money {
 			if val != -1 {
 				allInvalid = false
 				break
@@ -540,85 +389,185 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			fmt.Printf("Warning: Failed to get timecode: %v\n", err)
 			// Continue with money monitoring even if timecode fails
 		} else {
+			// If timecode ever decreases, assume this game session has ended
+			// and return so the caller can wait for a new game.
+			if lastTimecode != 0 && currentTimecode < lastTimecode {
+				fmt.Printf("Timecode decreased from %d to %d - ending monitoring and returning to waiting mode...\n",
+					lastTimecode, currentTimecode)
+				return eventCount
+			}
 			lastTimecode = currentTimecode
 			debugLog("Current timecode: %d\n", currentTimecode)
 		}
 
-		// Check if money values have changed
-		moneyChanged := false
-		for i, val := range vals {
-			if val != lastMoneyValues[i] {
-				moneyChanged = true
-				break
-			}
-		}
+		// Check if any values in PollResult have changed compared to the last poll we saw
+		// This ensures we only queue changes even if the API queue is backed up
+		// On first poll, always send to initialize the baseline
+		valuesChanged := firstPoll || pollResultChanged(vals, lastSeenPollResult)
 
-		if moneyChanged {
+		// Update lastSeenPollResult after each poll (regardless of whether we queue)
+		lastSeenPollResult = vals
+
+		if valuesChanged {
 			eventCount++
-			fmt.Printf("Money changed (event %d) - sending data (timecode: %d)...\n", eventCount, lastTimecode)
+			isFirstPoll := firstPoll // Capture the flag before it's updated
+			if firstPoll {
+				fmt.Printf("Initial poll (event %d) - queuing data (timecode: %d)...\n", eventCount, lastTimecode)
+				firstPoll = false
+			} else {
+				fmt.Printf("PollResult changed (event %d) - queuing data (timecode: %d)...\n", eventCount, lastTimecode)
+			}
 
 			// Determine seed to use for API calls
-			seedToUse := "direct-monitoring"
+			seedToUse := memReader.GetSeed()
 			if manualSeed != "" {
+				log.Printf("Using manual seed: %s", manualSeed)
 				seedToUse = manualSeed
+			} else {
+				log.Printf("Using seed from memory: %s", seedToUse)
 			}
 
-			// Send money data via API
-			err := sendMoneyData(apiURL, seedToUse, lastTimecode, vals)
-			if err != nil {
-				fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
-			} else {
-				fmt.Println("Money data sent successfully")
+			// Get lastSentPollResult for API request (to determine which fields changed)
+			lastSentPollResultMutex.Lock()
+			lastSentCopy := lastSentPollResult
+			lastSentPollResultMutex.Unlock()
+
+			// Create success channel to track API call result
+			successChan := make(chan bool, 1)
+
+			// Queue the API request (non-blocking if buffer has space)
+			select {
+			case requestQueue <- QueuedAPIRequest{
+				APIURL:      apiURL,
+				Seed:        seedToUse,
+				TimeCode:    lastTimecode,
+				Current:     vals,
+				Previous:    lastSentCopy,
+				IsFirstPoll: isFirstPoll,
+				SuccessChan: successChan,
+			}:
+				// Request queued successfully
+				// Handle success/failure asynchronously
+				go func(currentVals zhreader.PollResult) {
+					success := <-successChan
+					if success {
+						// Update last sent PollResult only after successful send
+						lastSentPollResultMutex.Lock()
+						lastSentPollResult = currentVals
+						lastSentPollResultMutex.Unlock()
+						lastEventTimeMutex.Lock()
+						lastEventTimeMutex.Unlock()
+					}
+				}(vals)
+			default:
+				// Queue is full - log warning but continue polling
+				fmt.Printf("Warning: API request queue is full, dropping request (event %d)\n", eventCount)
 			}
 
 			// Display memory values
 			j, _ := json.Marshal(struct {
 				P [8]int32 `json:"p"`
-			}{vals})
+			}{vals.Money})
 			fmt.Printf("Memory values: %s\n", string(j))
-
-			// Update last known values
-			lastMoneyValues = vals
-			lastEventTime = time.Now()
-		}
-
-		// Check for timeout due to inactivity
-		timeSinceLastEvent := time.Since(lastEventTime)
-		if timeSinceLastEvent > timeout {
-			fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
-			return eventCount
 		}
 	}
 }
 
 // MoneyDataRequest represents the API request for player money data
+// Only changed fields are included (except Seed and Timecode which are always included)
 type MoneyDataRequest struct {
-	Seed         string `json:"seed"`
-	Timecode     int64  `json:"timecode"`
-	Player1Money int64  `json:"player_1_money"`
-	Player2Money int64  `json:"player_2_money"`
-	Player3Money int64  `json:"player_3_money"`
-	Player4Money int64  `json:"player_4_money"`
-	Player5Money int64  `json:"player_5_money"`
-	Player6Money int64  `json:"player_6_money"`
-	Player7Money int64  `json:"player_7_money"`
-	Player8Money int64  `json:"player_8_money"`
+	Seed                     string       `json:"seed"`
+	Timecode                 int64        `json:"timecode"`
+	Money                    *[8]int32    `json:"money,omitempty"`
+	MoneyEarned              *[8]int32    `json:"money_earned,omitempty"`
+	UnitsBuilt               *[8]int32    `json:"units_built,omitempty"`
+	UnitsLost                *[8]int32    `json:"units_lost,omitempty"`
+	BuildingsBuilt           *[8]int32    `json:"buildings_built,omitempty"`
+	BuildingsLost            *[8]int32    `json:"buildings_lost,omitempty"`
+	BuildingsKilled          *[8][8]int32 `json:"buildings_killed,omitempty"`
+	UnitsKilled              *[8][8]int32 `json:"units_killed,omitempty"`
+	GeneralsPointsTotal      *[8]int32    `json:"generals_points_total,omitempty"`
+	GeneralsPointsUsed       *[8]int32    `json:"generals_points_used,omitempty"`
+	RadarsBuilt              *[8]int32    `json:"radars_built,omitempty"`
+	SearchAndDestroy         *[8]int32    `json:"search_and_destroy,omitempty"`
+	HoldTheLine              *[8]int32    `json:"hold_the_line,omitempty"`
+	Bombardment              *[8]int32    `json:"bombardment,omitempty"`
+	XP                       *[8]int32    `json:"xp,omitempty"`
+	XPLevel                  *[8]int32    `json:"xp_level,omitempty"`
+	TechBuildingsCaptured    *[8]int32    `json:"tech_buildings_captured,omitempty"`
+	FactionBuildingsCaptured *[8]int32    `json:"faction_buildings_captured,omitempty"`
+	PowerTotal               *[8]int32    `json:"power_total,omitempty"`
+	PowerUsed                *[8]int32    `json:"power_used,omitempty"`
 }
 
 // sendMoneyData sends player money data to the API endpoint
-func sendMoneyData(apiURL string, seed string, timeCode uint32, playerMoney [8]int32) error {
-	// Create the request payload
+// Only changed fields are included (except Seed and Timecode which are always included)
+func sendMoneyData(apiURL string, seed string, timeCode uint32, current zhreader.PollResult, previous zhreader.PollResult, isFirstPoll bool) error {
+	// Create the request payload with only changed fields
 	request := MoneyDataRequest{
-		Seed:         seed,
-		Timecode:     int64(timeCode),
-		Player1Money: int64(playerMoney[0]),
-		Player2Money: int64(playerMoney[1]),
-		Player3Money: int64(playerMoney[2]),
-		Player4Money: int64(playerMoney[3]),
-		Player5Money: int64(playerMoney[4]),
-		Player6Money: int64(playerMoney[5]),
-		Player7Money: int64(playerMoney[6]),
-		Player8Money: int64(playerMoney[7]),
+		Seed:     seed,
+		Timecode: int64(timeCode),
+	}
+	// Only include fields that have changed (or on first poll, include all)
+	if isFirstPoll || current.Money != previous.Money {
+		request.Money = &current.Money
+	}
+	if isFirstPoll || current.MoneyEarned != previous.MoneyEarned {
+		request.MoneyEarned = &current.MoneyEarned
+	}
+	if isFirstPoll || current.UnitsBuilt != previous.UnitsBuilt {
+		request.UnitsBuilt = &current.UnitsBuilt
+	}
+	if isFirstPoll || current.UnitsLost != previous.UnitsLost {
+		request.UnitsLost = &current.UnitsLost
+	}
+	if isFirstPoll || current.BuildingsBuilt != previous.BuildingsBuilt {
+		request.BuildingsBuilt = &current.BuildingsBuilt
+	}
+	if isFirstPoll || current.BuildingsLost != previous.BuildingsLost {
+		request.BuildingsLost = &current.BuildingsLost
+	}
+	if isFirstPoll || current.BuildingsKilled != previous.BuildingsKilled {
+		request.BuildingsKilled = &current.BuildingsKilled
+	}
+	if isFirstPoll || current.UnitsKilled != previous.UnitsKilled {
+		request.UnitsKilled = &current.UnitsKilled
+	}
+	if isFirstPoll || current.GeneralsPointsTotal != previous.GeneralsPointsTotal {
+		request.GeneralsPointsTotal = &current.GeneralsPointsTotal
+	}
+	if isFirstPoll || current.GeneralsPointsUsed != previous.GeneralsPointsUsed {
+		request.GeneralsPointsUsed = &current.GeneralsPointsUsed
+	}
+	if isFirstPoll || current.RadarsBuilt != previous.RadarsBuilt {
+		request.RadarsBuilt = &current.RadarsBuilt
+	}
+	if isFirstPoll || current.SearchAndDestroy != previous.SearchAndDestroy {
+		request.SearchAndDestroy = &current.SearchAndDestroy
+	}
+	if isFirstPoll || current.HoldTheLine != previous.HoldTheLine {
+		request.HoldTheLine = &current.HoldTheLine
+	}
+	if isFirstPoll || current.Bombardment != previous.Bombardment {
+		request.Bombardment = &current.Bombardment
+	}
+	if isFirstPoll || current.XP != previous.XP {
+		request.XP = &current.XP
+	}
+	if isFirstPoll || current.XPLevel != previous.XPLevel {
+		request.XPLevel = &current.XPLevel
+	}
+	if isFirstPoll || current.TechBuildingsCaptured != previous.TechBuildingsCaptured {
+		request.TechBuildingsCaptured = &current.TechBuildingsCaptured
+	}
+	if isFirstPoll || current.FactionBuildingsCaptured != previous.FactionBuildingsCaptured {
+		request.FactionBuildingsCaptured = &current.FactionBuildingsCaptured
+	}
+	if isFirstPoll || current.PowerTotal != previous.PowerTotal {
+		request.PowerTotal = &current.PowerTotal
+	}
+	if isFirstPoll || current.PowerUsed != previous.PowerUsed {
+		request.PowerUsed = &current.PowerUsed
 	}
 
 	// Marshal to JSON
@@ -626,6 +575,7 @@ func sendMoneyData(apiURL string, seed string, timeCode uint32, playerMoney [8]i
 	if err != nil {
 		return fmt.Errorf("failed to marshal money data: %w", err)
 	}
+	log.Printf("Sending HTTP request with the following values: %s", string(jsonData))
 
 	// Create HTTP request
 	req, err := http.NewRequest("POST", apiURL+"/player-money", bytes.NewBuffer(jsonData))
@@ -722,6 +672,8 @@ func showHelp() {
 	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
 	fmt.Println("  -seed string")
 	fmt.Println("        Manual seed value to use instead of reading from replay file")
+	fmt.Println("  -api-queue-size int")
+	fmt.Println("        Size of the API request queue buffer (default: 1000)")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()
