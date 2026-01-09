@@ -66,13 +66,14 @@ func main() {
 
 	// Parse command line arguments
 	var (
-		replayFile  = flag.String("file", defaultReplayFile, "Replay file to monitor")
-		pollDelay   = flag.Duration("delay", 50*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
-		timeout     = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
-		apiURL      = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
-		processName = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
-		help        = flag.Bool("help", false, "Show help information")
-		seed        = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
+		replayFile   = flag.String("file", defaultReplayFile, "Replay file to monitor")
+		pollDelay    = flag.Duration("delay", 50*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
+		timeout      = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
+		apiURL       = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
+		processName  = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
+		help         = flag.Bool("help", false, "Show help information")
+		seed         = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
+		apiQueueSize = flag.Int("api-queue-size", 1000, "Size of the API request queue buffer (default: 1000)")
 
 		// File search flags
 		searchFile    = flag.String("search-file", "", "Search for patterns in a static executable file")
@@ -132,7 +133,7 @@ func main() {
 		fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
 
 		// Process money monitoring until completion or timeout
-		eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed, sigChan)
+		eventCount := processMoneyMonitoring(memReader, *pollDelay, *timeout, *apiURL, *seed, *apiQueueSize, sigChan)
 
 		fmt.Printf("Money monitoring completed. Processed %d events.\n", eventCount)
 		memReader.Close()
@@ -313,7 +314,7 @@ func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, wg *sync.WaitGroup) 
 }
 
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
-func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string, sigChan <-chan os.Signal) int {
+func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration, timeout time.Duration, apiURL string, manualSeed string, apiQueueSize int, sigChan <-chan os.Signal) int {
 	debugLog("Starting processMoneyMonitoring...\n")
 
 	// Initialize monitoring state
@@ -326,8 +327,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 	firstPoll := true // Track if this is the first poll to initialize lastSentPollResult
 
 	// Create API request queue with buffer to prevent blocking
-	// Buffer size of 100 should be sufficient for most cases
-	requestQueue := make(chan QueuedAPIRequest, 10000)
+	requestQueue := make(chan QueuedAPIRequest, apiQueueSize)
 	var wg sync.WaitGroup
 
 	// Start API request worker
@@ -672,6 +672,8 @@ func showHelp() {
 	fmt.Println("        Test mode: process existing file immediately without waiting for file activity")
 	fmt.Println("  -seed string")
 	fmt.Println("        Manual seed value to use instead of reading from replay file")
+	fmt.Println("  -api-queue-size int")
+	fmt.Println("        Size of the API request queue buffer (default: 1000)")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()
