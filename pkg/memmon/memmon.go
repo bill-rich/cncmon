@@ -125,7 +125,7 @@ func (r *Reader) Close() {
 }
 
 func (r *Reader) GetSeed() string {
-	seed, ok := r.ReadPointerChain(0x0062B9FC)
+	seed, ok := r.ReadPointerChain(uintptr(r.base + 0x0062B9FC))
 	if !ok {
 		return ""
 	}
@@ -140,7 +140,7 @@ func (r *Reader) Poll() PollResult {
 
 	result := PollResult{
 		Money:                    r.pollPlayerMoney(playerOffsets),
-		MoneyEarned:              r.pollForAllPlayers(unitsBuiltInitialAddr, 0x2E4),
+		MoneyEarned:              r.pollForAllPlayers(unitsBuiltInitialAddr, 0x288),
 		UnitsBuilt:               r.pollForAllPlayers(unitsBuiltInitialAddr, 0x2D0),
 		UnitsLost:                r.pollForAllPlayers(unitsBuiltInitialAddr, 0x2D4),
 		BuildingsBuilt:           r.pollForAllPlayers(unitsBuiltInitialAddr, 0x318),
@@ -1064,6 +1064,5 @@ func (r *Reader) GetTimecode() (uint32, error) {
 		}
 	*/
 
-	log.Printf("Timecode: Read timecode %d from address 0x%X", timecode, timecodeAddr)
 	return timecode, nil
 }

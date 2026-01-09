@@ -318,11 +318,11 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 	// Initialize monitoring state
 	var lastSentPollResult zhreader.PollResult
-	var lastSentPollResultMutex sync.Mutex // Protect lastSentPollResult from race conditions
+	var lastSentPollResultMutex sync.Mutex     // Protect lastSentPollResult from race conditions
+	var lastSeenPollResult zhreader.PollResult // Track last poll result we saw (for change detection)
 	var lastTimecode uint32
 	eventCount := 0
 	var lastEventTimeMutex sync.Mutex
-	lastEventTime := time.Now()
 	firstPoll := true // Track if this is the first poll to initialize lastSentPollResult
 
 	// Create API request queue with buffer to prevent blocking
@@ -349,7 +349,6 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 	startTime := time.Now()
 
 	for {
-		log.Printf("Money monitoring: iteration %d, events: %d", loopCount, eventCount)
 		loopCount++
 		if loopCount%20 == 0 { // Log every 10 seconds (20 * 500ms)
 			fmt.Printf("Money monitoring: iteration %d, events: %d\n", loopCount, eventCount)
@@ -360,14 +359,12 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			fmt.Printf("No money changes detected after 30 seconds, this might indicate an issue\n")
 		}
 
-		log.Printf("Money monitoring: waiting for poll ticker")
 		// Use select to check for signals while waiting for ticker
 		select {
 		case <-sigChan:
 			fmt.Printf("\nReceived interrupt signal. Shutting down gracefully...\n")
 			panic("received interrupt signal")
 		case <-pollTicker.C:
-			log.Printf("Money monitoring: poll ticker received")
 		}
 		// Poll memory for money values
 		vals := memReader.Poll()
@@ -403,17 +400,15 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			debugLog("Current timecode: %d\n", currentTimecode)
 		}
 
-		// Check if any values in PollResult have changed
+		// Check if any values in PollResult have changed compared to the last poll we saw
+		// This ensures we only queue changes even if the API queue is backed up
 		// On first poll, always send to initialize the baseline
-		lastSentPollResultMutex.Lock()
-		lastSentCopy := lastSentPollResult
-		lastSentPollResultMutex.Unlock()
-		valuesChanged := firstPoll || pollResultChanged(vals, lastSentCopy)
+		valuesChanged := firstPoll || pollResultChanged(vals, lastSeenPollResult)
+
+		// Update lastSeenPollResult after each poll (regardless of whether we queue)
+		lastSeenPollResult = vals
 
 		if valuesChanged {
-			// Convert PollResult to json and log only when values change
-			valsJSON, _ := json.Marshal(vals)
-			log.Printf("Memory poll completed, got values: %s", string(valsJSON))
 			eventCount++
 			isFirstPoll := firstPoll // Capture the flag before it's updated
 			if firstPoll {
@@ -426,8 +421,16 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			// Determine seed to use for API calls
 			seedToUse := memReader.GetSeed()
 			if manualSeed != "" {
+				log.Printf("Using manual seed: %s", manualSeed)
 				seedToUse = manualSeed
+			} else {
+				log.Printf("Using seed from memory: %s", seedToUse)
 			}
+
+			// Get lastSentPollResult for API request (to determine which fields changed)
+			lastSentPollResultMutex.Lock()
+			lastSentCopy := lastSentPollResult
+			lastSentPollResultMutex.Unlock()
 
 			// Create success channel to track API call result
 			successChan := make(chan bool, 1)
@@ -453,7 +456,6 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 						lastSentPollResult = currentVals
 						lastSentPollResultMutex.Unlock()
 						lastEventTimeMutex.Lock()
-						lastEventTime = time.Now()
 						lastEventTimeMutex.Unlock()
 					}
 				}(vals)
@@ -467,15 +469,6 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 				P [8]int32 `json:"p"`
 			}{vals.Money})
 			fmt.Printf("Memory values: %s\n", string(j))
-		}
-
-		// Check for timeout due to inactivity
-		lastEventTimeMutex.Lock()
-		timeSinceLastEvent := time.Since(lastEventTime)
-		lastEventTimeMutex.Unlock()
-		if timeSinceLastEvent > timeout {
-			fmt.Printf("\nTimeout reached (no events for %v). Processed %d events before timeout.\n", timeout, eventCount)
-			return eventCount
 		}
 	}
 }
@@ -515,7 +508,6 @@ func sendMoneyData(apiURL string, seed string, timeCode uint32, current zhreader
 		Seed:     seed,
 		Timecode: int64(timeCode),
 	}
-
 	// Only include fields that have changed (or on first poll, include all)
 	if isFirstPoll || current.Money != previous.Money {
 		request.Money = &current.Money
@@ -583,6 +575,7 @@ func sendMoneyData(apiURL string, seed string, timeCode uint32, current zhreader
 	if err != nil {
 		return fmt.Errorf("failed to marshal money data: %w", err)
 	}
+	log.Printf("Sending HTTP request with the following values: %s", string(jsonData))
 
 	// Create HTTP request
 	req, err := http.NewRequest("POST", apiURL+"/player-money", bytes.NewBuffer(jsonData))
