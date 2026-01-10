@@ -126,8 +126,8 @@ func main() {
 		// Production mode: wait for timecode to start increasing
 		if !waitForTimecodeStart(memReader, sigChan) {
 			memReader.Close()
-			fmt.Println("Timecode monitoring interrupted. Exiting.")
-			return
+			fmt.Println("Timecode monitoring interrupted. Returning to process monitoring...")
+			continue
 		}
 
 		fmt.Printf("Timecode started increasing. Starting to monitor money values...\n")
@@ -190,7 +190,7 @@ func waitForTimecodeStart(memReader *zhreader.Reader, sigChan <-chan os.Signal) 
 		if err != nil {
 			fmt.Printf("Warning: Failed to read timecode: %v\n", err)
 			time.Sleep(500 * time.Millisecond)
-			continue
+			return false
 		}
 
 		// Only start once we've seen requiredIncreases consecutive increases in timecode.

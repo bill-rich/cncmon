@@ -3,6 +3,7 @@
 package automation
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"time"
@@ -22,7 +23,7 @@ func ClickAt(x, y int32) error {
 	return fmt.Errorf("mouse simulation not supported on this platform")
 }
 
-func ClickAtMultiple(coords []struct{ X, Y int32 }) error {
+func ClickAtMultiple(ctx context.Context, coords []struct{ X, Y int32 }) error {
 	return fmt.Errorf("mouse simulation not supported on this platform")
 }
 
@@ -38,12 +39,12 @@ func StartGenerals(exePath string) (*exec.Cmd, error) {
 	return nil, fmt.Errorf("process execution not supported on this platform")
 }
 
-func WaitForTimecodeStart(getTimecode func() (uint32, error), timeout time.Duration) error {
+func WaitForTimecodeStart(ctx context.Context, getTimecode func() (uint32, error), timeout time.Duration) error {
 	return fmt.Errorf("timecode monitoring not supported on this platform")
 }
 
-func WaitForTimecodeStop(getTimecode func() (uint32, error), timeout time.Duration) error {
-	return fmt.Errorf("timecode monitoring not supported on this platform")
+func WaitForTimecodeStop(ctx context.Context, getTimecode func() (uint32, error), timeout time.Duration) (uint32, error) {
+	return 0, fmt.Errorf("timecode monitoring not supported on this platform")
 }
 
 func CountRepFiles(dir string) (int, error) {

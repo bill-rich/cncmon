@@ -3,6 +3,7 @@
 package automation
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -433,13 +434,20 @@ func ClickAt(x, y int32) error {
 }
 
 // ClickAtMultiple simulates multiple mouse clicks at specified coordinates
-func ClickAtMultiple(coords []struct{ X, Y int32 }) error {
+func ClickAtMultiple(ctx context.Context, coords []struct{ X, Y int32 }) error {
 	for _, coord := range coords {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err := ClickAt(coord.X, coord.Y); err != nil {
 			return fmt.Errorf("failed to click at (%d, %d): %w", coord.X, coord.Y, err)
 		}
 		// Small delay between clicks
-		time.Sleep(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return nil
 }
@@ -503,7 +511,7 @@ func StartGenerals(exePath string) (*exec.Cmd, error) {
 }
 
 // WaitForTimecodeStart waits for the timecode to start increasing
-func WaitForTimecodeStart(getTimecode func() (uint32, error), timeout time.Duration) error {
+func WaitForTimecodeStart(ctx context.Context, getTimecode func() (uint32, error), timeout time.Duration) error {
 	fmt.Println("Waiting for timecode to start increasing...")
 
 	startTime := time.Now()
@@ -512,13 +520,21 @@ func WaitForTimecodeStart(getTimecode func() (uint32, error), timeout time.Durat
 	const requiredIncreases = 3
 
 	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		if time.Since(startTime) > timeout {
 			return fmt.Errorf("timeout waiting for timecode to start")
 		}
 
 		currentTimecode, err := getTimecode()
 		if err != nil {
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
 			continue
 		}
 
@@ -538,46 +554,54 @@ func WaitForTimecodeStart(getTimecode func() (uint32, error), timeout time.Durat
 		}
 
 		lastTimecode = currentTimecode
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
 // WaitForTimecodeStop waits for the timecode to stop increasing
-func WaitForTimecodeStop(getTimecode func() (uint32, error), timeout time.Duration) error {
+func WaitForTimecodeStop(ctx context.Context, getTimecode func() (uint32, error), timeout time.Duration) (uint32, error) {
 	fmt.Println("Waiting for timecode to stop increasing...")
 
 	startTime := time.Now()
 	var lastTimecode uint32 = 0
-	stableCount := 0
-	const requiredStable = 5 // Need 5 consecutive stable readings
+	var highestTimecode uint32 = 0
 
 	for {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+
 		if time.Since(startTime) > timeout {
-			return fmt.Errorf("timeout waiting for timecode to stop")
+			return 0, fmt.Errorf("timeout waiting for timecode to stop")
 		}
 
 		currentTimecode, err := getTimecode()
 		if err != nil {
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
 			continue
 		}
 
-		if lastTimecode != 0 {
-			if currentTimecode == lastTimecode {
-				stableCount++
-				if stableCount >= requiredStable {
-					fmt.Println("Timecode stopped increasing!")
-					return nil
-				}
-			} else {
-				// Timecode changed, reset stable count
-				stableCount = 0
-				fmt.Printf("Timecode: %d\n", currentTimecode)
-			}
+		if currentTimecode < lastTimecode {
+			fmt.Println("Timecode stopped increasing!")
+			return highestTimecode, nil
 		}
-
 		lastTimecode = currentTimecode
-		time.Sleep(500 * time.Millisecond)
+		if currentTimecode > highestTimecode {
+			highestTimecode = currentTimecode
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 

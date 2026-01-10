@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -83,18 +85,26 @@ func main() {
 	fmt.Printf("Clicks after stop: %d\n", len(clicksAfterStopCoords))
 	fmt.Println()
 
-	// Set up signal handling
+	// Set up context-based signal handling
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// Cancel context when signal is received
+	go func() {
+		sig := <-sigChan
+		fmt.Printf("\nReceived signal %v. Shutting down gracefully...\n", sig)
+		cancel()
+	}()
+
 	fileCount := 0
+	lastTimecode := uint32(0)
 	for {
-		// Check for interrupt
-		select {
-		case sig := <-sigChan:
-			fmt.Printf("\nReceived signal %v. Shutting down gracefully...\n", sig)
+		// Check if context is cancelled
+		if ctx.Err() != nil {
 			return
-		default:
 		}
 
 		// Check if there are any files left in DirectoryB
@@ -137,7 +147,10 @@ func main() {
 		}
 
 		// Wait a bit for window to appear, then set target window for PostMessage
-		time.Sleep(2 * time.Second)
+		if err := sleepWithContext(ctx, 2*time.Second); err != nil {
+			cmd.Process.Kill()
+			return
+		}
 		fmt.Println("Step 3.5: Finding game window...")
 		if err := automation.SetTargetWindow(uint32(cmd.Process.Pid)); err != nil {
 			fmt.Printf("Warning: Failed to find game window: %v (will try SendInput fallback)\n", err)
@@ -147,7 +160,10 @@ func main() {
 
 		// Wait for initial wait time
 		fmt.Printf("Step 4: Waiting %v...\n", *initialWait)
-		time.Sleep(*initialWait)
+		if err := sleepWithContext(ctx, *initialWait); err != nil {
+			cmd.Process.Kill()
+			return
+		}
 
 		// Step 5: Press Escape
 		fmt.Println("Step 5: Pressing Escape key...")
@@ -156,12 +172,19 @@ func main() {
 			cmd.Process.Kill()
 			continue
 		}
-		time.Sleep(10 * time.Second)
+		if err := sleepWithContext(ctx, 10*time.Second); err != nil {
+			cmd.Process.Kill()
+			return
+		}
 
 		// Step 6: Simulate mouse clicks before timecode start
 		if len(clicksBeforeStartCoords) > 0 {
 			fmt.Printf("Step 6: Simulating %d mouse clicks before timecode start...\n", len(clicksBeforeStartCoords))
-			if err := automation.ClickAtMultiple(clicksBeforeStartCoords); err != nil {
+			if err := automation.ClickAtMultiple(ctx, clicksBeforeStartCoords); err != nil {
+				if ctx.Err() != nil {
+					cmd.Process.Kill()
+					return
+				}
 				fmt.Printf("Error clicking: %v\n", err)
 				cmd.Process.Kill()
 				continue
@@ -172,19 +195,19 @@ func main() {
 		fmt.Println("Step 7: Waiting for generals.exe process to be available...")
 		var memReader *zhreader.Reader
 		for {
-			select {
-			case sig := <-sigChan:
-				fmt.Printf("\nReceived signal %v. Shutting down gracefully...\n", sig)
+			if ctx.Err() != nil {
 				cmd.Process.Kill()
 				return
-			default:
 			}
 
 			memReader, err = zhreader.Init(*processName)
 			if err == nil {
 				break
 			}
-			time.Sleep(1 * time.Second)
+			if err := sleepWithContext(ctx, 1*time.Second); err != nil {
+				cmd.Process.Kill()
+				return
+			}
 		}
 		defer memReader.Close()
 
@@ -194,15 +217,32 @@ func main() {
 			return memReader.GetTimecode()
 		}
 
-		if err := automation.WaitForTimecodeStart(getTimecode, *timecodeStartTimeout); err != nil {
+		if err := automation.WaitForTimecodeStart(ctx, getTimecode, *timecodeStartTimeout); err != nil {
+			if ctx.Err() != nil {
+				cmd.Process.Kill()
+				return
+			}
 			fmt.Printf("Error waiting for timecode to start: %v\n", err)
 			cmd.Process.Kill()
 			continue
 		}
 
+		// Step 8.5: Get game seed from memory
+		fmt.Println("Step 8.5: Getting game seed from memory...")
+		gameSeed := memReader.GetSeed()
+		if gameSeed == "" {
+			fmt.Printf("Error getting game seed: %v\n", err)
+			cmd.Process.Kill()
+			continue
+		}
+		fmt.Printf("Game seed: %s\n", gameSeed)
+
 		// Step 9: Press 'F' key after timecode starts (hardcoded)
 		fmt.Println("Step 9: Pressing 'F' key...")
-		time.Sleep(500 * time.Millisecond)
+		if err := sleepWithContext(ctx, 500*time.Millisecond); err != nil {
+			cmd.Process.Kill()
+			return
+		}
 		if err := automation.PressKey(VK_F); err != nil {
 			fmt.Printf("Error pressing 'F' key: %v\n", err)
 			cmd.Process.Kill()
@@ -211,17 +251,29 @@ func main() {
 
 		// Step 10: Wait for timecode to stop increasing
 		fmt.Println("Step 11: Waiting for timecode to stop increasing...")
-		if err := automation.WaitForTimecodeStop(getTimecode, *timecodeStopTimeout); err != nil {
+		lastTimecode, err = automation.WaitForTimecodeStop(ctx, getTimecode, *timecodeStopTimeout)
+		if err != nil {
+			if ctx.Err() != nil {
+				cmd.Process.Kill()
+				return
+			}
 			fmt.Printf("Error waiting for timecode to stop: %v\n", err)
 			cmd.Process.Kill()
 			continue
 		}
 
 		// Step 11: Simulate mouse clicks after timecode stops
-		time.Sleep(1 * time.Second)
+		if err := sleepWithContext(ctx, 1*time.Second); err != nil {
+			cmd.Process.Kill()
+			return
+		}
 		if len(clicksAfterStopCoords) > 0 {
 			fmt.Printf("Step 12: Simulating %d mouse clicks after timecode stops...\n", len(clicksAfterStopCoords))
-			if err := automation.ClickAtMultiple(clicksAfterStopCoords); err != nil {
+			if err := automation.ClickAtMultiple(ctx, clicksAfterStopCoords); err != nil {
+				if ctx.Err() != nil {
+					cmd.Process.Kill()
+					return
+				}
 				fmt.Printf("Error clicking: %v\n", err)
 			}
 		}
@@ -231,14 +283,74 @@ func main() {
 		if err := cmd.Process.Kill(); err != nil {
 			fmt.Printf("Warning: Error killing process: %v\n", err)
 		}
-		cmd.Wait()
+		// Make cmd.Wait() interruptible
+		waitDone := make(chan error, 1)
+		go func() {
+			waitDone <- cmd.Wait()
+		}()
+		select {
+		case <-ctx.Done():
+			return
+		case <-waitDone:
+		}
 
 		fmt.Printf("Completed processing file %d\n", fileCount)
-		time.Sleep(2 * time.Second) // Brief pause between files
+		if err := sleepWithContext(ctx, 2*time.Second); err != nil {
+			return
+		}
+
+		waitTime := 35
+		fmt.Printf("Last timecode: %d\n", lastTimecode)
+		if lastTimecode != 0 {
+			fmt.Printf("Last timecode is not 0, adding 2 seconds to wait time\n")
+			waitTime = int(lastTimecode/1000) + 2
+		}
+
+		fmt.Printf("Waiting %d seconds before triggering reparse...\n", waitTime)
+		if err := sleepWithContext(ctx, time.Duration(waitTime)*time.Second); err != nil {
+			return
+		}
+
+		// Trigger reparse on the radarvan api (curl -X 'POST' \ 'https://www.radarvan.com/api/reprase/123' \ -H 'accept: application/json' \ -d '')
+		// Use http request to trigger reparse
+		fmt.Printf("Triggering reparse on the radarvan api for seed: %s\n", gameSeed)
+		req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("https://www.radarvan.com/api/reprase/%s", gameSeed), nil)
+		if err != nil {
+			fmt.Printf("Error creating request: %v\n", err)
+			return
+		}
+		req.Header.Set("accept", "application/json")
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			fmt.Printf("Error sending request: %v\n", err)
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fmt.Printf("Error triggering reparse: %s\n", resp.Status)
+			return
+		}
+		fmt.Printf("Reparse triggered successfully\n")
 	}
 
 	fmt.Printf("\n=== Automation Complete ===\n")
 	fmt.Printf("Processed %d file(s)\n", fileCount)
+}
+
+// sleepWithContext sleeps for the specified duration, but returns early if context is cancelled
+func sleepWithContext(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // parseCoordinates parses a coordinate string in the format "x1,y1;x2,y2;..."
