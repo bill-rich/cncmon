@@ -3,8 +3,13 @@
 package automation
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -613,4 +618,97 @@ func CountRepFiles(dir string) (int, error) {
 		return 0, fmt.Errorf("failed to glob pattern: %w", err)
 	}
 	return len(matches), nil
+}
+
+// ReplayHeader represents the header structure from the API response
+type ReplayHeader struct {
+	BuildDate string `json:"BuildDate"`
+}
+
+// ReplayResponse represents the API response structure
+type ReplayResponse struct {
+	Header ReplayHeader `json:"Header"`
+}
+
+// ValidateReplayFile uploads the replay file to the API and checks if BuildDate matches
+// Returns true if BuildDate matches "Mar 10 2005 13:47:03", false otherwise
+func ValidateReplayFile(filePath string, apiURL string) (bool, string, error) {
+	// Open the file
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to open file: %w", err)
+	}
+	defer file.Close()
+
+	// Create a multipart form
+	var requestBody bytes.Buffer
+	writer := multipart.NewWriter(&requestBody)
+
+	// Add the file to the form
+	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+	if err != nil {
+		return false, "", fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	_, err = io.Copy(part, file)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to copy file content: %w", err)
+	}
+
+	err = writer.Close()
+	if err != nil {
+		return false, "", fmt.Errorf("failed to close writer: %w", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", apiURL, &requestBody)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	// Send the request
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to send request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return false, "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Parse JSON response
+	var replayResp ReplayResponse
+	if err := json.Unmarshal(body, &replayResp); err != nil {
+		return false, "", fmt.Errorf("failed to parse JSON response: %w", err)
+	}
+
+	expectedBuildDate := "Mar 10 2005 13:47:03"
+	actualBuildDate := replayResp.Header.BuildDate
+
+	return actualBuildDate == expectedBuildDate, actualBuildDate, nil
+}
+
+// MoveFileBackWithOldExtension moves a file from DirectoryA back to DirectoryB with .old extension
+func MoveFileBackWithOldExtension(filePath, directoryB string) error {
+	fileName := filepath.Base(filePath)
+	// Remove .rep extension and add .old
+	nameWithoutExt := fileName[:len(fileName)-len(filepath.Ext(fileName))]
+	newFileName := nameWithoutExt + ".old"
+	destPath := filepath.Join(directoryB, newFileName)
+
+	if err := os.Rename(filePath, destPath); err != nil {
+		return fmt.Errorf("failed to move file %s to %s: %w", filePath, destPath, err)
+	}
+
+	fmt.Printf("Moved file back with .old extension: %s -> %s\n", filePath, destPath)
+	return nil
 }

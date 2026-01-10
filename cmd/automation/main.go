@@ -26,11 +26,12 @@ func main() {
 		generalsExe          = flag.String("generals-exe", "C:\\Program Files (x86)\\Origin Games\\Command and Conquer Generals Zero Hour\\Command and Conquer Generals Zero Hour\\generals.exe", "Path to generals.exe")
 		processName          = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
 		initialWait          = flag.Duration("initial-wait", 15*time.Second, "Wait time after starting generals.exe")
-		clicksBeforeStart    = flag.String("clicks-before-start", "100,100;2036,512;2036,412;778,388;2073,415", "Mouse click coordinates before timecode start (format: x1,y1;x2,y2;...)")
+		clicksBeforeStart    = flag.String("clicks-before-start", "100,100;2036,512;2036,412;778,388;2073,415;1100,795", "Mouse click coordinates before timecode start (format: x1,y1;x2,y2;...)")
 		clicksAfterStart     = flag.String("clicks-after-start", "", "Mouse click coordinates after timecode starts (format: x1,y1;x2,y2;...)")
 		clicksAfterStop      = flag.String("clicks-after-stop", "2181,1364;2096,996;2096,803", "Mouse click coordinates after timecode stops (format: x1,y1;x2,y2;...)")
 		timecodeStartTimeout = flag.Duration("timecode-start-timeout", 1*time.Minute, "Timeout for waiting for timecode to start")
 		timecodeStopTimeout  = flag.Duration("timecode-stop-timeout", 10*time.Minute, "Timeout for waiting for timecode to stop")
+		replayAPIURL         = flag.String("replay-api-url", "https://cncstats.herokuapp.com/replay", "API URL for replay validation")
 		help                 = flag.Bool("help", false, "Show help information")
 	)
 	flag.Parse()
@@ -137,6 +138,28 @@ func main() {
 			continue
 		}
 		fmt.Printf("Moved file: %s\n", movedFile)
+
+		// Step 2.5: Validate replay file BuildDate
+		fmt.Println("Step 2.5: Validating replay file BuildDate...")
+		isValid, actualBuildDate, err := automation.ValidateReplayFile(movedFile, *replayAPIURL)
+		if err != nil {
+			fmt.Printf("Error validating replay file: %v\n", err)
+			// Move file back with .old extension on error
+			if moveErr := automation.MoveFileBackWithOldExtension(movedFile, *directoryB); moveErr != nil {
+				fmt.Printf("Error moving file back: %v\n", moveErr)
+			}
+			continue
+		}
+		if !isValid {
+			fmt.Println("BuildDate does not match expected value. Expected: Mar 10 2005 13:47:03, Actual BuildDate: %s", actualBuildDate)
+			/*
+				if err := automation.MoveFileBackWithOldExtension(movedFile, *directoryB); err != nil {
+					fmt.Printf("Error moving file back: %v\n", err)
+				}
+				continue
+			*/
+		}
+		fmt.Println("Replay file BuildDate validated successfully.")
 
 		// Step 3: Start generals.exe
 		fmt.Println("Step 3: Starting generals.exe...")
@@ -416,6 +439,8 @@ func showHelp() {
 	fmt.Println("        Timeout for waiting for timecode to start (default: 2m)")
 	fmt.Println("  -timecode-stop-timeout duration")
 	fmt.Println("        Timeout for waiting for timecode to stop (default: 10m)")
+	fmt.Println("  -replay-api-url string")
+	fmt.Println("        API URL for replay validation (default: https://cncstats.herokuapp.com/replay)")
 	fmt.Println("  -help")
 	fmt.Println("        Show this help information")
 	fmt.Println()

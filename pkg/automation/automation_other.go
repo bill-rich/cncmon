@@ -54,3 +54,14 @@ func CountRepFiles(dir string) (int, error) {
 func SetTargetWindow(pid uint32) error {
 	return fmt.Errorf("window management not supported on this platform")
 }
+
+// ValidateReplayFile uploads the replay file to the API and checks if BuildDate matches
+// Returns true if BuildDate matches "Mar 10 2005 13:47:03", false otherwise
+func ValidateReplayFile(filePath string, apiURL string) (bool, error) {
+	return false, fmt.Errorf("replay validation not supported on this platform")
+}
+
+// MoveFileBackWithOldExtension moves a file from DirectoryA back to DirectoryB with .old extension
+func MoveFileBackWithOldExtension(filePath, directoryB string) error {
+	return fmt.Errorf("file operations not supported on this platform")
+}
