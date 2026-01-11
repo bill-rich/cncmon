@@ -508,6 +508,13 @@ func sendMoneyData(apiURL string, seed string, timeCode uint32, current zhreader
 		Seed:     seed,
 		Timecode: int64(timeCode),
 	}
+
+	switch {
+	case current.Money == [8]int32{0, 0, 0, 0, 0, 0, 0, 0}:
+		return nil
+	case seed == "0":
+		return nil
+	}
 	// Only include fields that have changed (or on first poll, include all)
 	if isFirstPoll || current.Money != previous.Money {
 		request.Money = &current.Money

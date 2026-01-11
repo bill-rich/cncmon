@@ -207,9 +207,10 @@ func (r *Reader) pollPlayerMoney(playerOffsets [8]uint32) [8]int32 {
 	}
 
 	// Read all 9 values first using ReadPointerChain
-	var tempValues [8]int32
-	for i := 0; i < 8; i++ {
-		val, ok := r.ReadPointerChain(r.initialAddr, playerOffsets[i], 0x38)
+	var tempValues [9]int32
+	for i := 0; i <= 8; i++ {
+		playerOffset := playerOffsets[0] + 0x4 * uint32(i)
+		val, ok := r.ReadPointerChain(r.initialAddr, playerOffset, 0x38)
 		if !ok {
 			tempValues[i] = -1
 			continue
@@ -220,7 +221,7 @@ func (r *Reader) pollPlayerMoney(playerOffsets [8]uint32) [8]int32 {
 
 	// Find the last positive value and replace it and following zeros with -1
 	lastPositiveIndex := -1
-	for i := 0; i < 8; i++ {
+	for i := 0; i < 9; i++ {
 		if tempValues[i] > 0 {
 			lastPositiveIndex = i
 		}
