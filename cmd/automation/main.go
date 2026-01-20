@@ -101,7 +101,7 @@ func main() {
 	}()
 
 	fileCount := 0
-	lastTimecode := uint32(0)
+	// lastTimecode := uint32(0)
 	for {
 		// Check if context is cancelled
 		if ctx.Err() != nil {
@@ -274,7 +274,7 @@ func main() {
 
 		// Step 10: Wait for timecode to stop increasing
 		fmt.Println("Step 11: Waiting for timecode to stop increasing...")
-		lastTimecode, err = automation.WaitForTimecodeStop(ctx, getTimecode, *timecodeStopTimeout)
+		_, err = automation.WaitForTimecodeStop(ctx, getTimecode, *timecodeStopTimeout)
 		if err != nil {
 			if ctx.Err() != nil {
 				cmd.Process.Kill()
@@ -322,15 +322,17 @@ func main() {
 			return
 		}
 
-		waitTime := 35
-		fmt.Printf("Last timecode: %d\n", lastTimecode)
-		if lastTimecode != 0 {
-			fmt.Printf("Last timecode is not 0, adding 2 seconds to wait time\n")
-			waitTime = int(lastTimecode/1000) + 2
-		}
+		/*
+			waitTime := 35
+			fmt.Printf("Last timecode: %d\n", lastTimecode)
+			if lastTimecode != 0 {
+				fmt.Printf("Last timecode is not 0, adding 2 seconds to wait time\n")
+				waitTime = int(lastTimecode/1000) + 2
+			}
+		*/
 
-		fmt.Printf("Waiting %d seconds before triggering reparse...\n", waitTime)
-		if err := sleepWithContext(ctx, time.Duration(waitTime)*time.Second); err != nil {
+		fmt.Printf("Waiting %d seconds before triggering reparse...\n", 2)
+		if err := sleepWithContext(ctx, time.Duration(2)*time.Second); err != nil {
 			return
 		}
 
