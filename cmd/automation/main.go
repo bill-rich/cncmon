@@ -27,8 +27,9 @@ const blacklistFile = "blacklisted_match_ids.txt"
 
 // ReplayInfo represents a replay from the API
 type ReplayInfo struct {
-	MatchID int    `json:"match_id"`
-	URL     string `json:"url"`
+	MatchID      int    `json:"match_id"`
+	URL          string `json:"url"`
+	PresignedURL string `json:"presigned_url"`
 }
 
 // Blacklist manages a set of blacklisted match IDs
@@ -211,8 +212,13 @@ func downloadReplayFile(ctx context.Context, url string, destDir string) (string
 		return "", fmt.Errorf("download returned status: %s", resp.Status)
 	}
 
-	// Extract filename from URL
-	filename := filepath.Base(url)
+	// Extract filename from URL, stripping query parameters
+	// For presigned URLs, we only want the base filename before the "?"
+	urlPath := url
+	if idx := strings.Index(url, "?"); idx != -1 {
+		urlPath = url[:idx]
+	}
+	filename := filepath.Base(urlPath)
 	if filename == "" || filename == "." || filename == "/" {
 		filename = "replay.rep"
 	}
@@ -238,6 +244,40 @@ func downloadReplayFile(ctx context.Context, url string, destDir string) (string
 	}
 
 	return destPath, nil
+}
+
+// downloadReplayFileWithFallback downloads a replay file, trying the primary URL first, then falling back to presigned URL if available
+func downloadReplayFileWithFallback(ctx context.Context, replay ReplayInfo, destDir string) (string, error) {
+	// Try the primary URL first
+	if replay.URL != "" {
+		filePath, err := downloadReplayFile(ctx, replay.URL, destDir)
+		if err == nil {
+			return filePath, nil
+		}
+		// If we got an error, check if it's a 404 or other error
+		// For non-404 errors, we might want to try the fallback
+		if strings.Contains(err.Error(), "404_NOT_FOUND") {
+			// 404 means the file doesn't exist, try presigned URL if available
+			if replay.PresignedURL != "" {
+				fmt.Printf("Primary URL returned 404, trying presigned URL...\n")
+				return downloadReplayFile(ctx, replay.PresignedURL, destDir)
+			}
+			return "", err
+		}
+		// For other errors, try presigned URL if available
+		if replay.PresignedURL != "" {
+			fmt.Printf("Primary URL failed with error: %v, trying presigned URL...\n", err)
+			return downloadReplayFile(ctx, replay.PresignedURL, destDir)
+		}
+		return "", err
+	}
+
+	// If no primary URL, try presigned URL
+	if replay.PresignedURL != "" {
+		return downloadReplayFile(ctx, replay.PresignedURL, destDir)
+	}
+
+	return "", fmt.Errorf("no URL available for download")
 }
 
 // triggerReparse triggers a reparse on the radarvan API for the given game seed
@@ -474,7 +514,7 @@ func main() {
 
 			// Download the first replay
 			fmt.Println("Step 2 (continued): Downloading replay file...")
-			movedFile, err := downloadReplayFile(ctx, replays[0].URL, *directoryA)
+			movedFile, err := downloadReplayFileWithFallback(ctx, replays[0], *directoryA)
 			if err != nil {
 				// Check if it's a 404 error
 				if strings.Contains(err.Error(), "404_NOT_FOUND") {
