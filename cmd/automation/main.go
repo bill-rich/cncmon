@@ -478,12 +478,87 @@ func main() {
 			return
 		}
 
+		// Track the current match_id being processed for blacklisting on crash
+		var lastMatchID int
+
+		// Channel to monitor process exit
+		cmdExitCh := make(chan struct{})
+		go func() {
+			cmd.Wait()
+			close(cmdExitCh)
+		}()
+
 		// Main loop: fetch replays and process them
 		for {
 			// Check if context is cancelled
 			if ctx.Err() != nil {
 				cmd.Process.Kill()
 				return
+			}
+
+			// Check if exe is still running
+			select {
+			case <-cmdExitCh:
+				// Process has exited unexpectedly
+				fmt.Println("Process exited unexpectedly!")
+				if lastMatchID > 0 {
+					fmt.Printf("Adding match_id %d to blacklist (process crashed)\n", lastMatchID)
+					if err := blacklist.AddWithComment(lastMatchID, "process crashed during replay", blacklistFile); err != nil {
+						fmt.Printf("Warning: Failed to add to blacklist: %v\n", err)
+					}
+				}
+
+				// Restart the exe
+				fmt.Println("Restarting generals.exe...")
+				cmd, err = automation.StartGenerals(*generalsExe)
+				if err != nil {
+					fmt.Printf("Error restarting generals.exe: %v\n", err)
+					os.Exit(1)
+				}
+
+				// Setup new exit channel
+				cmdExitCh = make(chan struct{})
+				go func() {
+					cmd.Wait()
+					close(cmdExitCh)
+				}()
+
+				// Wait a bit for window to appear, then set target window for PostMessage
+				if err := sleepWithContext(ctx, 2*time.Second); err != nil {
+					cmd.Process.Kill()
+					return
+				}
+				fmt.Println("Finding game window...")
+				if err := automation.SetTargetWindow(uint32(cmd.Process.Pid)); err != nil {
+					fmt.Printf("Warning: Failed to find game window: %v (will try SendInput fallback)\n", err)
+				} else {
+					fmt.Println("Game window found - using PostMessage for input (works better with DirectInput games)")
+				}
+
+				// Wait for initial wait time
+				fmt.Printf("Waiting %v...\n", *initialWait)
+				if err := sleepWithContext(ctx, *initialWait); err != nil {
+					cmd.Process.Kill()
+					return
+				}
+
+				// Press Escape
+				fmt.Println("Pressing Escape key...")
+				if err := automation.PressEscape(); err != nil {
+					fmt.Printf("Error pressing Escape: %v\n", err)
+					cmd.Process.Kill()
+					os.Exit(1)
+				}
+				if err := sleepWithContext(ctx, 10*time.Second); err != nil {
+					cmd.Process.Kill()
+					return
+				}
+
+				// Reset lastMatchID since we're starting fresh
+				lastMatchID = 0
+				continue
+			default:
+				// Process is still running, continue normally
 			}
 
 			// Step 2: Fetch replays from API and download the first one
@@ -502,6 +577,7 @@ func main() {
 
 			fileCount++
 			currentMatchID := replays[0].MatchID
+			lastMatchID = currentMatchID // Track for blacklisting on crash
 			fmt.Printf("\n=== Processing file %d (match_id: %d) ===\n", fileCount, currentMatchID)
 
 			// Step 1: Delete all .rep files from DirectoryA
