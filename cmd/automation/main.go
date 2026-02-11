@@ -662,7 +662,9 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 			return fmt.Errorf("validating replay: %w", err)
 		}
 		if !isValid {
-			fmt.Printf("Warning: BuildDate mismatch. Expected: Mar 10 2005 13:47:03, Got: %s\n", actualBuildDate)
+			fmt.Printf("Warning: Version mistmatch, Expected: Version 1.04 Got: %s\n", actualBuildDate)
+			blacklist.AddWithComment(currentMatchID, fmt.Sprintf("Version: %s", actualBuildDate), blacklistFile)
+			continue
 		}
 
 		// Process the replay
@@ -672,6 +674,7 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 				return nil
 			}
 			fmt.Printf("Error processing replay: %v\n", result.Error)
+			gp.Kill()
 			continue
 		}
 
