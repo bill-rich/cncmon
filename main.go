@@ -1,20 +1,25 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	zhreader "github.com/bill-rich/cncmon/pkg/memmon"
+	"github.com/bill-rich/cncmon/pkg/proto/player_money"
 )
 
 var debugEnabled bool
@@ -27,13 +32,22 @@ func debugLog(format string, args ...interface{}) {
 
 // QueuedAPIRequest represents an API request that needs to be sent
 type QueuedAPIRequest struct {
-	APIURL      string
 	Seed        string
 	TimeCode    uint32
 	Current     zhreader.PollResult
 	Previous    zhreader.PollResult
 	IsFirstPoll bool
 	SuccessChan chan bool // Channel to signal success/failure
+}
+
+// GRPCClient wraps the gRPC client and stream
+type GRPCClient struct {
+	conn   *grpc.ClientConn
+	client player_money.PlayerMoneyServiceClient
+	stream grpc.BidiStreamingClient[player_money.MoneyDataRequest, player_money.MoneyDataResponse]
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
 }
 
 // EventData stores event information with money values for API transmission
@@ -69,7 +83,7 @@ func main() {
 		replayFile   = flag.String("file", defaultReplayFile, "Replay file to monitor")
 		pollDelay    = flag.Duration("delay", 50*time.Millisecond, "Delay between memory polls (unused - now polls every 50ms)")
 		timeout      = flag.Duration("timeout", 2*time.Minute, "Timeout for file inactivity before returning to waiting mode")
-		apiURL       = flag.String("api", "https://cncstats.herokuapp.com", "API endpoint URL for sending money data")
+		apiURL       = flag.String("api", "http://cncstats.computersrfun.org", "gRPC endpoint URL for sending money data")
 		processName  = flag.String("process", "generals.exe", "Process name to monitor (default: generals.exe)")
 		help         = flag.Bool("help", false, "Show help information")
 		seed         = flag.String("seed", "", "Manual seed value to use instead of reading from replay file")
@@ -294,23 +308,85 @@ func pollResultChanged(current, previous zhreader.PollResult) bool {
 	return false
 }
 
-// apiRequestWorker processes API requests from the queue
-func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, wg *sync.WaitGroup) {
+// apiRequestWorker processes API requests from the queue using gRPC streaming
+// with retry logic to handle temporary failures
+func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, grpcClient *GRPCClient, wg *sync.WaitGroup, apiURL string) {
 	defer wg.Done()
+	const maxRetries = 3
+	const baseRetryDelay = 100 * time.Millisecond
+
 	for req := range requestQueue {
-		err := sendMoneyData(req.APIURL, req.Seed, req.TimeCode, req.Current, req.Previous, req.IsFirstPoll)
-		if err != nil {
-			fmt.Printf("Warning: Failed to send money data via API: %v\n", err)
+		var err error
+		retryCount := 0
+
+		// Retry loop with exponential backoff
+		for retryCount <= maxRetries {
+			err = sendMoneyDataGRPC(grpcClient, req.Seed, req.TimeCode, req.Current, req.Previous, req.IsFirstPoll)
+			if err == nil {
+				// Success - break out of retry loop
+				if retryCount > 0 {
+					fmt.Printf("Money data sent successfully via gRPC after %d retries\n", retryCount)
+				} else {
+					debugLog("Money data sent successfully via gRPC\n")
+				}
+				if req.SuccessChan != nil {
+					req.SuccessChan <- true
+				}
+				break
+			}
+
+			// Check if error is recoverable (connection issue)
+			if isConnectionError(err) && retryCount < maxRetries {
+				retryCount++
+				retryDelay := baseRetryDelay * time.Duration(1<<uint(retryCount-1)) // Exponential backoff
+				fmt.Printf("Warning: Failed to send money data via gRPC (attempt %d/%d): %v. Retrying in %v...\n",
+					retryCount, maxRetries+1, err, retryDelay)
+
+				// Try to reconnect if connection is broken
+				if retryCount == 1 {
+					grpcAddr, parseErr := parseAPIURLForGRPC(apiURL)
+					if parseErr == nil {
+						newClient, reconnectErr := reconnectGRPCClient(grpcClient, grpcAddr)
+						if reconnectErr == nil {
+							grpcClient = newClient
+							fmt.Println("gRPC connection reestablished")
+						}
+					}
+				}
+
+				time.Sleep(retryDelay)
+				continue
+			}
+
+			// Non-recoverable error or max retries reached
+			fmt.Printf("Warning: Failed to send money data via gRPC after %d attempts: %v\n", retryCount+1, err)
 			if req.SuccessChan != nil {
 				req.SuccessChan <- false
 			}
-		} else {
-			fmt.Println("Money data sent successfully")
-			if req.SuccessChan != nil {
-				req.SuccessChan <- true
-			}
+			break
 		}
 	}
+}
+
+// isConnectionError checks if the error is a connection-related error that might be recoverable
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Check for common connection error patterns
+	return strings.Contains(errStr, "connection") || strings.Contains(errStr, "unavailable") ||
+		strings.Contains(errStr, "deadline exceeded") || strings.Contains(errStr, "transport") ||
+		strings.Contains(errStr, "EOF") || strings.Contains(errStr, "broken pipe")
+}
+
+// reconnectGRPCClient attempts to reconnect the gRPC client
+func reconnectGRPCClient(oldClient *GRPCClient, addr string) (*GRPCClient, error) {
+	// Close old connection
+	oldClient.Close()
+
+	// Create new connection
+	return createGRPCClient(addr)
 }
 
 // processMoneyMonitoring monitors money values and timecode without replay file dependency
@@ -326,19 +402,75 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 	var lastEventTimeMutex sync.Mutex
 	firstPoll := true // Track if this is the first poll to initialize lastSentPollResult
 
+	// Parse API URL and create gRPC connection
+	grpcAddr, err := parseAPIURLForGRPC(apiURL)
+	if err != nil {
+		fmt.Printf("Error parsing API URL for gRPC: %v\n", err)
+		return eventCount
+	}
+
+	// Create gRPC client
+	grpcClient, err := createGRPCClient(grpcAddr)
+	if err != nil {
+		fmt.Printf("Error creating gRPC client: %v\n", err)
+		return eventCount
+	}
+	defer grpcClient.Close()
+
 	// Create API request queue with buffer to prevent blocking
 	requestQueue := make(chan QueuedAPIRequest, apiQueueSize)
 	var wg sync.WaitGroup
+	shutdownRequested := make(chan struct{})
+	var shutdownOnce sync.Once
 
-	// Start API request worker
+	// Start API request worker with API URL for reconnection
 	wg.Add(1)
-	go apiRequestWorker(requestQueue, &wg)
+	go apiRequestWorker(requestQueue, grpcClient, &wg, apiURL)
+
+	// Graceful shutdown function that drains the queue before closing
+	gracefulShutdown := func() {
+		shutdownOnce.Do(func() {
+			fmt.Println("Initiating graceful shutdown - waiting for queue to drain...")
+			close(shutdownRequested)
+
+			// Wait for queue to drain with timeout
+			drainTimeout := 30 * time.Second
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
+			defer drainCancel()
+
+			// Monitor queue depth
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+
+			drained := false
+			for !drained {
+				queueDepth := len(requestQueue)
+				if queueDepth == 0 {
+					fmt.Println("Queue drained successfully")
+					drained = true
+					break
+				}
+
+				select {
+				case <-drainCtx.Done():
+					fmt.Printf("Queue drain timeout after %v. %d items remaining in queue.\n", drainTimeout, queueDepth)
+					drained = true
+					break
+				case <-ticker.C:
+					fmt.Printf("Waiting for queue to drain... %d items remaining\n", queueDepth)
+				}
+			}
+
+			// Close queue and wait for worker
+			close(requestQueue)
+			fmt.Println("Waiting for worker to finish processing...")
+			wg.Wait()
+			fmt.Println("Graceful shutdown complete")
+		})
+	}
 
 	// Ensure worker goroutine is cleaned up on exit
-	defer func() {
-		close(requestQueue)
-		wg.Wait()
-	}()
+	defer gracefulShutdown()
 
 	// Start polling timer
 	pollTicker := time.NewTicker(pollDelay)
@@ -379,7 +511,9 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 		}
 		if allInvalid {
 			fmt.Println("Warning: All memory values are invalid. Generals.exe process may have gone away.")
-			fmt.Println("Returning to process monitoring...")
+			fmt.Println("Stopping new event queuing and waiting for queue to drain...")
+			// Trigger graceful shutdown - this will drain the queue before returning
+			gracefulShutdown()
 			return eventCount
 		}
 
@@ -394,6 +528,9 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			if lastTimecode != 0 && currentTimecode < lastTimecode {
 				fmt.Printf("Timecode decreased from %d to %d - ending monitoring and returning to waiting mode...\n",
 					lastTimecode, currentTimecode)
+				fmt.Println("Stopping new event queuing and waiting for queue to drain...")
+				// Trigger graceful shutdown - this will drain the queue before returning
+				gracefulShutdown()
 				return eventCount
 			}
 			lastTimecode = currentTimecode
@@ -407,6 +544,14 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 
 		// Update lastSeenPollResult after each poll (regardless of whether we queue)
 		lastSeenPollResult = vals
+
+		// Check if shutdown has been requested - don't queue new items if shutting down
+		select {
+		case <-shutdownRequested:
+			// Shutdown requested, skip queuing new items
+			continue
+		default:
+		}
 
 		if valuesChanged {
 			eventCount++
@@ -435,10 +580,13 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 			// Create success channel to track API call result
 			successChan := make(chan bool, 1)
 
-			// Queue the API request (non-blocking if buffer has space)
+			// Queue the API request with timeout to prevent indefinite blocking
+			// but still wait for queue space to become available
+			queueTimeout := 5 * time.Second
+			queueCtx, queueCancel := context.WithTimeout(context.Background(), queueTimeout)
+
 			select {
 			case requestQueue <- QueuedAPIRequest{
-				APIURL:      apiURL,
 				Seed:        seedToUse,
 				TimeCode:    lastTimecode,
 				Current:     vals,
@@ -447,6 +595,7 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 				SuccessChan: successChan,
 			}:
 				// Request queued successfully
+				queueCancel()
 				// Handle success/failure asynchronously
 				go func(currentVals zhreader.PollResult) {
 					success := <-successChan
@@ -459,9 +608,26 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 						lastEventTimeMutex.Unlock()
 					}
 				}(vals)
-			default:
-				// Queue is full - log warning but continue polling
-				fmt.Printf("Warning: API request queue is full, dropping request (event %d)\n", eventCount)
+			case <-queueCtx.Done():
+				// Queue timeout - log warning but continue polling
+				queueDepth := len(requestQueue)
+				fmt.Printf("Warning: API request queue timeout after %v (queue depth: %d/%d, event %d). "+
+					"API may be backed up. Continuing to poll...\n", queueTimeout, queueDepth, apiQueueSize, eventCount)
+				queueCancel()
+				// Signal failure to prevent goroutine leak
+				select {
+				case successChan <- false:
+				default:
+				}
+			}
+
+			// Log queue depth periodically for monitoring
+			if eventCount%10 == 0 {
+				queueDepth := len(requestQueue)
+				if queueDepth > apiQueueSize/2 {
+					fmt.Printf("Queue depth: %d/%d (%.1f%% full)\n", queueDepth, apiQueueSize,
+						float64(queueDepth)/float64(apiQueueSize)*100)
+				}
 			}
 
 			// Display memory values
@@ -473,136 +639,164 @@ func processMoneyMonitoring(memReader *zhreader.Reader, pollDelay time.Duration,
 	}
 }
 
-// MoneyDataRequest represents the API request for player money data
-// Only changed fields are included (except Seed and Timecode which are always included)
-type MoneyDataRequest struct {
-	Seed                     string       `json:"seed"`
-	Timecode                 int64        `json:"timecode"`
-	Money                    *[8]int32    `json:"money,omitempty"`
-	MoneyEarned              *[8]int32    `json:"money_earned,omitempty"`
-	UnitsBuilt               *[8]int32    `json:"units_built,omitempty"`
-	UnitsLost                *[8]int32    `json:"units_lost,omitempty"`
-	BuildingsBuilt           *[8]int32    `json:"buildings_built,omitempty"`
-	BuildingsLost            *[8]int32    `json:"buildings_lost,omitempty"`
-	BuildingsKilled          *[8][8]int32 `json:"buildings_killed,omitempty"`
-	UnitsKilled              *[8][8]int32 `json:"units_killed,omitempty"`
-	GeneralsPointsTotal      *[8]int32    `json:"generals_points_total,omitempty"`
-	GeneralsPointsUsed       *[8]int32    `json:"generals_points_used,omitempty"`
-	RadarsBuilt              *[8]int32    `json:"radars_built,omitempty"`
-	SearchAndDestroy         *[8]int32    `json:"search_and_destroy,omitempty"`
-	HoldTheLine              *[8]int32    `json:"hold_the_line,omitempty"`
-	Bombardment              *[8]int32    `json:"bombardment,omitempty"`
-	XP                       *[8]int32    `json:"xp,omitempty"`
-	XPLevel                  *[8]int32    `json:"xp_level,omitempty"`
-	TechBuildingsCaptured    *[8]int32    `json:"tech_buildings_captured,omitempty"`
-	FactionBuildingsCaptured *[8]int32    `json:"faction_buildings_captured,omitempty"`
-	PowerTotal               *[8]int32    `json:"power_total,omitempty"`
-	PowerUsed                *[8]int32    `json:"power_used,omitempty"`
+// parseAPIURLForGRPC extracts the hostname from the API URL and returns gRPC address with port 9090
+func parseAPIURLForGRPC(apiURL string) (string, error) {
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse API URL: %w", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("invalid API URL: no hostname found")
+	}
+	return fmt.Sprintf("%s:9090", host), nil
 }
 
-// sendMoneyData sends player money data to the API endpoint
-// Only changed fields are included (except Seed and Timecode which are always included)
-func sendMoneyData(apiURL string, seed string, timeCode uint32, current zhreader.PollResult, previous zhreader.PollResult, isFirstPoll bool) error {
-	// Create the request payload with only changed fields
-	request := MoneyDataRequest{
-		Seed:     seed,
-		Timecode: int64(timeCode),
+// createGRPCClient creates a gRPC client connection and stream
+func createGRPCClient(addr string) (*GRPCClient, error) {
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to gRPC server: %w", err)
 	}
 
+	client := player_money.NewPlayerMoneyServiceClient(conn)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stream, err := client.StreamCreatePlayerMoneyData(ctx)
+	if err != nil {
+		cancel()
+		conn.Close()
+		return nil, fmt.Errorf("failed to create stream: %w", err)
+	}
+
+	return &GRPCClient{
+		conn:   conn,
+		client: client,
+		stream: stream,
+		ctx:    ctx,
+		cancel: cancel,
+	}, nil
+}
+
+// Close closes the gRPC connection and stream
+func (c *GRPCClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+// convertArray8ToSlice converts [8]int32 to []int32
+func convertArray8ToSlice(arr [8]int32) []int32 {
+	return arr[:]
+}
+
+// convertArray8x8ToProto converts [8][8]int32 to []*Int32Array8X8
+func convertArray8x8ToProto(arr [8][8]int32) []*player_money.Int32Array8X8 {
+	result := make([]*player_money.Int32Array8X8, 8)
+	for i := 0; i < 8; i++ {
+		result[i] = &player_money.Int32Array8X8{
+			Values: arr[i][:],
+		}
+	}
+	return result
+}
+
+// sendMoneyDataGRPC sends player money data via gRPC streaming
+// Only changed fields are included (except Seed and Timecode which are always included)
+func sendMoneyDataGRPC(grpcClient *GRPCClient, seed string, timeCode uint32, current zhreader.PollResult, previous zhreader.PollResult, isFirstPoll bool) error {
+	// Early return for invalid data
 	switch {
 	case current.Money == [8]int32{0, 0, 0, 0, 0, 0, 0, 0}:
 		return nil
 	case seed == "0":
 		return nil
 	}
+
+	grpcClient.mu.Lock()
+	defer grpcClient.mu.Unlock()
+
+	// Create the request payload with only changed fields
+	request := &player_money.MoneyDataRequest{
+		Seed:     seed,
+		Timecode: int64(timeCode),
+	}
+
 	// Only include fields that have changed (or on first poll, include all)
 	if isFirstPoll || current.Money != previous.Money {
-		request.Money = &current.Money
+		request.Money = convertArray8ToSlice(current.Money)
 	}
 	if isFirstPoll || current.MoneyEarned != previous.MoneyEarned {
-		request.MoneyEarned = &current.MoneyEarned
+		request.MoneyEarned = convertArray8ToSlice(current.MoneyEarned)
 	}
 	if isFirstPoll || current.UnitsBuilt != previous.UnitsBuilt {
-		request.UnitsBuilt = &current.UnitsBuilt
+		request.UnitsBuilt = convertArray8ToSlice(current.UnitsBuilt)
 	}
 	if isFirstPoll || current.UnitsLost != previous.UnitsLost {
-		request.UnitsLost = &current.UnitsLost
+		request.UnitsLost = convertArray8ToSlice(current.UnitsLost)
 	}
 	if isFirstPoll || current.BuildingsBuilt != previous.BuildingsBuilt {
-		request.BuildingsBuilt = &current.BuildingsBuilt
+		request.BuildingsBuilt = convertArray8ToSlice(current.BuildingsBuilt)
 	}
 	if isFirstPoll || current.BuildingsLost != previous.BuildingsLost {
-		request.BuildingsLost = &current.BuildingsLost
+		request.BuildingsLost = convertArray8ToSlice(current.BuildingsLost)
 	}
 	if isFirstPoll || current.BuildingsKilled != previous.BuildingsKilled {
-		request.BuildingsKilled = &current.BuildingsKilled
+		request.BuildingsKilled = convertArray8x8ToProto(current.BuildingsKilled)
 	}
 	if isFirstPoll || current.UnitsKilled != previous.UnitsKilled {
-		request.UnitsKilled = &current.UnitsKilled
+		request.UnitsKilled = convertArray8x8ToProto(current.UnitsKilled)
 	}
 	if isFirstPoll || current.GeneralsPointsTotal != previous.GeneralsPointsTotal {
-		request.GeneralsPointsTotal = &current.GeneralsPointsTotal
+		request.GeneralsPointsTotal = convertArray8ToSlice(current.GeneralsPointsTotal)
 	}
 	if isFirstPoll || current.GeneralsPointsUsed != previous.GeneralsPointsUsed {
-		request.GeneralsPointsUsed = &current.GeneralsPointsUsed
+		request.GeneralsPointsUsed = convertArray8ToSlice(current.GeneralsPointsUsed)
 	}
 	if isFirstPoll || current.RadarsBuilt != previous.RadarsBuilt {
-		request.RadarsBuilt = &current.RadarsBuilt
+		request.RadarsBuilt = convertArray8ToSlice(current.RadarsBuilt)
 	}
 	if isFirstPoll || current.SearchAndDestroy != previous.SearchAndDestroy {
-		request.SearchAndDestroy = &current.SearchAndDestroy
+		request.SearchAndDestroy = convertArray8ToSlice(current.SearchAndDestroy)
 	}
 	if isFirstPoll || current.HoldTheLine != previous.HoldTheLine {
-		request.HoldTheLine = &current.HoldTheLine
+		request.HoldTheLine = convertArray8ToSlice(current.HoldTheLine)
 	}
 	if isFirstPoll || current.Bombardment != previous.Bombardment {
-		request.Bombardment = &current.Bombardment
+		request.Bombardment = convertArray8ToSlice(current.Bombardment)
 	}
 	if isFirstPoll || current.XP != previous.XP {
-		request.XP = &current.XP
+		request.Xp = convertArray8ToSlice(current.XP)
 	}
 	if isFirstPoll || current.XPLevel != previous.XPLevel {
-		request.XPLevel = &current.XPLevel
+		request.XpLevel = convertArray8ToSlice(current.XPLevel)
 	}
 	if isFirstPoll || current.TechBuildingsCaptured != previous.TechBuildingsCaptured {
-		request.TechBuildingsCaptured = &current.TechBuildingsCaptured
+		request.TechBuildingsCaptured = convertArray8ToSlice(current.TechBuildingsCaptured)
 	}
 	if isFirstPoll || current.FactionBuildingsCaptured != previous.FactionBuildingsCaptured {
-		request.FactionBuildingsCaptured = &current.FactionBuildingsCaptured
+		request.FactionBuildingsCaptured = convertArray8ToSlice(current.FactionBuildingsCaptured)
 	}
 	if isFirstPoll || current.PowerTotal != previous.PowerTotal {
-		request.PowerTotal = &current.PowerTotal
+		request.PowerTotal = convertArray8ToSlice(current.PowerTotal)
 	}
 	if isFirstPoll || current.PowerUsed != previous.PowerUsed {
-		request.PowerUsed = &current.PowerUsed
+		request.PowerUsed = convertArray8ToSlice(current.PowerUsed)
 	}
 
-	// Marshal to JSON
-	jsonData, err := json.Marshal(request)
-	if err != nil {
-		return fmt.Errorf("failed to marshal money data: %w", err)
-	}
-	log.Printf("Sending HTTP request with the following values: %s", string(jsonData))
+	// Log the request (for debugging)
+	jsonData, _ := json.Marshal(request)
+	log.Printf("Sending gRPC request with the following values: %s", string(jsonData))
 
-	// Create HTTP request
-	req, err := http.NewRequest("POST", apiURL+"/player-money", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	// Send the request
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send HTTP request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Check response status
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("API request failed with status: %d", resp.StatusCode)
+	// Send via gRPC stream
+	if err := grpcClient.stream.Send(request); err != nil {
+		return fmt.Errorf("failed to send gRPC message: %w", err)
 	}
 
 	return nil

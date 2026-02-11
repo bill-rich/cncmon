@@ -623,6 +623,7 @@ func CountRepFiles(dir string) (int, error) {
 // ReplayHeader represents the header structure from the API response
 type ReplayHeader struct {
 	BuildDate string `json:"BuildDate"`
+	Version   string "json:Version"
 }
 
 // ReplayResponse represents the API response structure
@@ -691,10 +692,12 @@ func ValidateReplayFile(filePath string, apiURL string) (bool, string, error) {
 		return false, "", fmt.Errorf("failed to parse JSON response: %w", err)
 	}
 
-	expectedBuildDate := "Mar 10 2005 13:47:03"
-	actualBuildDate := replayResp.Header.BuildDate
+	expectedVersion := "Version 1.04"
+	actualVersion := replayResp.Header.Version
+	// expectedBuildDate := "Mar 10 2005 13:47:03"
+	// actualBuildDate := replayResp.Header.BuildDate
 
-	return actualBuildDate == expectedBuildDate, actualBuildDate, nil
+	return actualVersion == expectedVersion, actualVersion, nil
 }
 
 // MoveFileBackWithOldExtension moves a file from DirectoryA back to DirectoryB with .old extension

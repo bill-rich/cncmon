@@ -57,8 +57,8 @@ func SetTargetWindow(pid uint32) error {
 
 // ValidateReplayFile uploads the replay file to the API and checks if BuildDate matches
 // Returns true if BuildDate matches "Mar 10 2005 13:47:03", false otherwise
-func ValidateReplayFile(filePath string, apiURL string) (bool, error) {
-	return false, fmt.Errorf("replay validation not supported on this platform")
+func ValidateReplayFile(filePath string, apiURL string) (bool, string, error) {
+	return false, "", fmt.Errorf("replay validation not supported on this platform")
 }
 
 // MoveFileBackWithOldExtension moves a file from DirectoryA back to DirectoryB with .old extension
