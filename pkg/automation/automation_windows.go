@@ -631,9 +631,9 @@ type ReplayResponse struct {
 	Header ReplayHeader `json:"Header"`
 }
 
-// ValidateReplayFile uploads the replay file to the API and checks if BuildDate matches
-// Returns true if BuildDate matches "Mar 10 2005 13:47:03", false otherwise
-func ValidateReplayFile(filePath string, apiURL string) (bool, string, error) {
+// ValidateReplayFile uploads the replay file to the API and checks if Version matches
+// Returns true if Version matches the expected version, false otherwise
+func ValidateReplayFile(filePath string, apiURL string, expectedVersion string) (bool, string, error) {
 	// Open the file
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -692,11 +692,7 @@ func ValidateReplayFile(filePath string, apiURL string) (bool, string, error) {
 		return false, "", fmt.Errorf("failed to parse JSON response: %w", err)
 	}
 
-	expectedVersion := "Version 1.04"
 	actualVersion := replayResp.Header.Version
-	// expectedBuildDate := "Mar 10 2005 13:47:03"
-	// actualBuildDate := replayResp.Header.BuildDate
-
 	return actualVersion == expectedVersion, actualVersion, nil
 }
 

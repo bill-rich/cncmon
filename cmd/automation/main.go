@@ -42,6 +42,7 @@ type Config struct {
 	ReplayAPIURL         string
 	UseAPI               bool
 	MaxReplays           int
+	ExpectedVersion      string
 }
 
 // Coordinate represents an x,y screen position.
@@ -657,13 +658,13 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 
 		// Validate replay
 		fmt.Println("Validating replay file...")
-		isValid, actualBuildDate, err := automation.ValidateReplayFile(replayPath, config.ReplayAPIURL)
+		isValid, actualVersion, err := automation.ValidateReplayFile(replayPath, config.ReplayAPIURL, config.ExpectedVersion)
 		if err != nil {
 			return fmt.Errorf("validating replay: %w", err)
 		}
 		if !isValid {
-			fmt.Printf("Warning: Version mistmatch, Expected: Version 1.04 Got: %s\n", actualBuildDate)
-			blacklist.AddWithComment(currentMatchID, fmt.Sprintf("Version: %s", actualBuildDate), blacklistFile)
+			fmt.Printf("Warning: Version mismatch, Expected: %s Got: %s\n", config.ExpectedVersion, actualVersion)
+			blacklist.AddWithComment(currentMatchID, fmt.Sprintf("Version: %s", actualVersion), blacklistFile)
 			continue
 		}
 
@@ -751,7 +752,7 @@ func runDirectoryMode(ctx context.Context, config *Config, blacklist *Blacklist)
 
 		// Validate replay
 		fmt.Println("Validating replay file...")
-		isValid, actualBuildDate, err := automation.ValidateReplayFile(movedFile, config.ReplayAPIURL)
+		isValid, actualVersion, err := automation.ValidateReplayFile(movedFile, config.ReplayAPIURL, config.ExpectedVersion)
 		if err != nil {
 			fmt.Printf("Error validating: %v\n", err)
 			automation.MoveFileBackWithOldExtension(movedFile, config.DirectoryB)
@@ -759,7 +760,7 @@ func runDirectoryMode(ctx context.Context, config *Config, blacklist *Blacklist)
 			continue
 		}
 		if !isValid {
-			fmt.Printf("Warning: BuildDate mismatch. Expected: Mar 10 2005 13:47:03, Got: %s\n", actualBuildDate)
+			fmt.Printf("Warning: Version mismatch. Expected: %s, Got: %s\n", config.ExpectedVersion, actualVersion)
 		}
 
 		// Process the replay
@@ -842,8 +843,10 @@ func main() {
 
 func parseFlags() (*Config, error) {
 	var (
-		directoryA           = flag.String("dir-a", "C:\\Users\\Bill\\Documents\\Command and Conquer Generals Zero Hour Data\\Replays", "Directory A (destination)")
-		directoryB           = flag.String("dir-b", "C:\\Users\\Bill\\Desktop\\Replays", "Directory B (source)")
+		user                 = flag.String("user", "Bill", "Windows username for default paths")
+		expectedVersion      = flag.String("expected-version", "Version 1.04", "Expected replay version string")
+		directoryA           = flag.String("dir-a", "", "Directory A (destination)")
+		directoryB           = flag.String("dir-b", "", "Directory B (source)")
 		generalsExe          = flag.String("generals-exe", "C:\\Program Files (x86)\\Origin Games\\Command and Conquer Generals Zero Hour\\Command and Conquer Generals Zero Hour\\generals.exe", "Path to generals.exe")
 		processName          = flag.String("process", "generals.exe", "Process name to monitor")
 		initialWait          = flag.Duration("initial-wait", 15*time.Second, "Wait time after starting")
@@ -858,6 +861,14 @@ func parseFlags() (*Config, error) {
 		help                 = flag.Bool("help", false, "Show help")
 	)
 	flag.Parse()
+
+	// Apply user-based defaults for directories if not explicitly set
+	if *directoryA == "" {
+		*directoryA = fmt.Sprintf("C:\\Users\\%s\\Documents\\Command and Conquer Generals Zero Hour Data\\Replays", *user)
+	}
+	if *directoryB == "" {
+		*directoryB = fmt.Sprintf("C:\\Users\\%s\\Desktop\\Replays", *user)
+	}
 
 	if *help {
 		showHelp()
@@ -903,6 +914,7 @@ func parseFlags() (*Config, error) {
 		ReplayAPIURL:         *replayAPIURL,
 		UseAPI:               *useAPI,
 		MaxReplays:           *maxReplays,
+		ExpectedVersion:      *expectedVersion,
 	}, nil
 }
 
@@ -916,6 +928,7 @@ func printConfig(config *Config) {
 		fmt.Printf("Directory B (source): %s\n", config.DirectoryB)
 	}
 	fmt.Printf("Generals.exe: %s\n", config.GeneralsExe)
+	fmt.Printf("Expected version: %s\n", config.ExpectedVersion)
 	fmt.Printf("Initial wait: %v\n", config.InitialWait)
 	fmt.Printf("Clicks before start: %d\n", len(config.ClicksBeforeStart))
 	fmt.Printf("Key after start: F (0x%02X)\n", VK_F)
@@ -985,8 +998,10 @@ func showHelp() {
 	fmt.Println("Usage: automation [flags]")
 	fmt.Println()
 	fmt.Println("Flags:")
-	fmt.Println("  -dir-a string              Directory A - destination for replay files (required)")
-	fmt.Println("  -dir-b string              Directory B - source for replay files (required without -use-api)")
+	fmt.Println("  -user string               Windows username for default paths (default: Bill)")
+	fmt.Println("  -expected-version string   Expected replay version string (default: Version 1.04)")
+	fmt.Println("  -dir-a string              Directory A - destination for replay files (default: C:\\Users\\<user>\\Documents\\...)")
+	fmt.Println("  -dir-b string              Directory B - source for replay files (default: C:\\Users\\<user>\\Desktop\\Replays)")
 	fmt.Println("  -generals-exe string       Path to generals.exe (required)")
 	fmt.Println("  -process string            Process name to monitor (default: generals.exe)")
 	fmt.Println("  -initial-wait duration     Wait time after starting (default: 15s)")
@@ -1003,6 +1018,6 @@ func showHelp() {
 	fmt.Println("Note: The 'F' key is automatically pressed after timecode starts.")
 	fmt.Println()
 	fmt.Println("Example:")
-	fmt.Println("  automation -dir-a C:\\replays\\processed -dir-b C:\\replays\\queue \\")
+	fmt.Println("  automation -user John -dir-a C:\\replays\\processed -dir-b C:\\replays\\queue \\")
 	fmt.Println("    -generals-exe C:\\game\\generals.exe -clicks-before-start \"100,200;300,400\"")
 }

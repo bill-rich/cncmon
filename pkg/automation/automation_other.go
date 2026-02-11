@@ -55,9 +55,9 @@ func SetTargetWindow(pid uint32) error {
 	return fmt.Errorf("window management not supported on this platform")
 }
 
-// ValidateReplayFile uploads the replay file to the API and checks if BuildDate matches
-// Returns true if BuildDate matches "Mar 10 2005 13:47:03", false otherwise
-func ValidateReplayFile(filePath string, apiURL string) (bool, string, error) {
+// ValidateReplayFile uploads the replay file to the API and checks if Version matches
+// Returns true if Version matches the expected version, false otherwise
+func ValidateReplayFile(filePath string, apiURL string, expectedVersion string) (bool, string, error) {
 	return false, "", fmt.Errorf("replay validation not supported on this platform")
 }
 
