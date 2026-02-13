@@ -20,6 +20,7 @@ import (
 
 	"github.com/bill-rich/cncmon/pkg/automation"
 	zhreader "github.com/bill-rich/cncmon/pkg/memmon"
+	"github.com/bill-rich/cncmon/pkg/monitor"
 )
 
 const (
@@ -43,6 +44,13 @@ type Config struct {
 	UseAPI               bool
 	MaxReplays           int
 	ExpectedVersion      string
+
+	// Monitor configuration
+	MonitorAPIURL       string
+	MonitorAPIQueueSize int
+	MonitorPollDelay    time.Duration
+	MonitorTimeout      time.Duration
+	MonitorDebug        bool
 }
 
 // Coordinate represents an x,y screen position.
@@ -569,6 +577,19 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 	gp := NewGeneralsProcess(config.GeneralsExe)
 	processor := NewReplayProcessor(config, blacklist)
 
+	// Create and start the monitor
+	monitorConfig := monitor.Config{
+		ProcessName:  config.ProcessName,
+		APIURL:       config.MonitorAPIURL,
+		APIQueueSize: config.MonitorAPIQueueSize,
+		PollDelay:    config.MonitorPollDelay,
+		Timeout:      config.MonitorTimeout,
+		Debug:        config.MonitorDebug,
+	}
+	mon := monitor.New(monitorConfig)
+	mon.Start()
+	defer mon.Stop()
+
 	fmt.Println("Starting generals.exe for API mode...")
 	if err := gp.Start(); err != nil {
 		return err
@@ -687,6 +708,16 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 		// Track this as the last successfully completed match_id
 		lastSuccessfulMatchID = currentMatchID
 		fmt.Printf("Completed processing file %d\n", fileCount)
+
+		// Wait for monitor to be ready for next replay (back at waitForTimecodeStart)
+		fmt.Println("Waiting for monitor to be ready for next replay...")
+		if err := mon.WaitForReadyOrContext(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Printf("Warning: Error waiting for monitor: %v\n", err)
+		}
+		fmt.Println("Monitor is ready for next replay")
 	}
 
 	return nil
@@ -696,6 +727,19 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 func runDirectoryMode(ctx context.Context, config *Config, blacklist *Blacklist) error {
 	processor := NewReplayProcessor(config, blacklist)
 	fileCount := 0
+
+	// Create and start the monitor
+	monitorConfig := monitor.Config{
+		ProcessName:  config.ProcessName,
+		APIURL:       config.MonitorAPIURL,
+		APIQueueSize: config.MonitorAPIQueueSize,
+		PollDelay:    config.MonitorPollDelay,
+		Timeout:      config.MonitorTimeout,
+		Debug:        config.MonitorDebug,
+	}
+	mon := monitor.New(monitorConfig)
+	mon.Start()
+	defer mon.Stop()
 
 	for {
 		if ctx.Err() != nil {
@@ -785,6 +829,17 @@ func runDirectoryMode(ctx context.Context, config *Config, blacklist *Blacklist)
 		gp.Wait(ctx)
 
 		fmt.Printf("Completed processing file %d\n", fileCount)
+
+		// Wait for monitor to be ready for next replay (back at waitForTimecodeStart)
+		fmt.Println("Waiting for monitor to be ready for next replay...")
+		if err := mon.WaitForReadyOrContext(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			fmt.Printf("Warning: Error waiting for monitor: %v\n", err)
+		}
+		fmt.Println("Monitor is ready for next replay")
+
 		sleepWithContext(ctx, 2*time.Second)
 	}
 
@@ -859,6 +914,13 @@ func parseFlags() (*Config, error) {
 		useAPI               = flag.Bool("use-api", false, "Use API mode")
 		maxReplays           = flag.Int("max-replays", 10, "Max replays to fetch from API")
 		help                 = flag.Bool("help", false, "Show help")
+
+		// Monitor configuration flags
+		monitorAPIURL       = flag.String("monitor-api-url", "http://cncstats.computersrfun.org", "gRPC endpoint URL for monitor data")
+		monitorAPIQueueSize = flag.Int("monitor-api-queue-size", 1000, "Size of the monitor API request queue buffer")
+		monitorPollDelay    = flag.Duration("monitor-poll-delay", 50*time.Millisecond, "Delay between monitor memory polls")
+		monitorTimeout      = flag.Duration("monitor-timeout", 2*time.Minute, "Monitor timeout for inactivity")
+		monitorDebug        = flag.Bool("monitor-debug", false, "Enable monitor debug logging")
 	)
 	flag.Parse()
 
@@ -915,6 +977,13 @@ func parseFlags() (*Config, error) {
 		UseAPI:               *useAPI,
 		MaxReplays:           *maxReplays,
 		ExpectedVersion:      *expectedVersion,
+
+		// Monitor configuration
+		MonitorAPIURL:       *monitorAPIURL,
+		MonitorAPIQueueSize: *monitorAPIQueueSize,
+		MonitorPollDelay:    *monitorPollDelay,
+		MonitorTimeout:      *monitorTimeout,
+		MonitorDebug:        *monitorDebug,
 	}, nil
 }
 
@@ -934,6 +1003,13 @@ func printConfig(config *Config) {
 	fmt.Printf("Key after start: F (0x%02X)\n", VK_F)
 	fmt.Printf("Clicks after start: %d\n", len(config.ClicksAfterStart))
 	fmt.Printf("Clicks after stop: %d\n", len(config.ClicksAfterStop))
+	fmt.Println()
+	fmt.Println("Monitor Settings:")
+	fmt.Printf("  API URL: %s\n", config.MonitorAPIURL)
+	fmt.Printf("  API Queue Size: %d\n", config.MonitorAPIQueueSize)
+	fmt.Printf("  Poll Delay: %v\n", config.MonitorPollDelay)
+	fmt.Printf("  Timeout: %v\n", config.MonitorTimeout)
+	fmt.Printf("  Debug: %v\n", config.MonitorDebug)
 	fmt.Println()
 }
 
@@ -1014,6 +1090,13 @@ func showHelp() {
 	fmt.Println("  -use-api                   Use API mode: fetch replays from radarvan API")
 	fmt.Println("  -max-replays int           Max replays to fetch per API request (default: 10)")
 	fmt.Println("  -help                      Show this help")
+	fmt.Println()
+	fmt.Println("Monitor Options (runs cncmon in parallel):")
+	fmt.Println("  -monitor-api-url string    gRPC endpoint URL for monitor (default: http://cncstats.computersrfun.org)")
+	fmt.Println("  -monitor-api-queue-size    Size of the monitor API queue buffer (default: 1000)")
+	fmt.Println("  -monitor-poll-delay        Delay between monitor memory polls (default: 50ms)")
+	fmt.Println("  -monitor-timeout           Monitor timeout for inactivity (default: 2m)")
+	fmt.Println("  -monitor-debug             Enable monitor debug logging")
 	fmt.Println()
 	fmt.Println("Note: The 'F' key is automatically pressed after timecode starts.")
 	fmt.Println()
