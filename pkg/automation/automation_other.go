@@ -35,7 +35,7 @@ func MoveOneRepFile(sourceDir, destDir string) (string, error) {
 	return "", fmt.Errorf("file operations not supported on this platform")
 }
 
-func StartGenerals(exePath string) (*exec.Cmd, error) {
+func StartGenerals(exePath string, args ...string) (*exec.Cmd, error) {
 	return nil, fmt.Errorf("process execution not supported on this platform")
 }
 
@@ -55,10 +55,10 @@ func SetTargetWindow(pid uint32) error {
 	return fmt.Errorf("window management not supported on this platform")
 }
 
-// ValidateReplayFile uploads the replay file to the API and checks if Version matches
-// Returns true if Version matches the expected version, false otherwise
-func ValidateReplayFile(filePath string, apiURL string, expectedVersion string) (bool, string, error) {
-	return false, "", fmt.Errorf("replay validation not supported on this platform")
+// ValidateReplayFile uploads the replay file to the API and returns the version.
+// Returns the version string from the replay header.
+func ValidateReplayFile(filePath string, apiURL string) (string, error) {
+	return "", fmt.Errorf("replay validation not supported on this platform")
 }
 
 // MoveFileBackWithOldExtension moves a file from DirectoryA back to DirectoryB with .old extension

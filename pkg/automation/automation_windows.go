@@ -500,9 +500,9 @@ func MoveOneRepFile(sourceDir, destDir string) (string, error) {
 	return destFile, nil
 }
 
-// StartGenerals starts generals.exe with the specified path
-func StartGenerals(exePath string) (*exec.Cmd, error) {
-	cmd := exec.Command(exePath)
+// StartGenerals starts generals.exe with the specified path and optional arguments
+func StartGenerals(exePath string, args ...string) (*exec.Cmd, error) {
+	cmd := exec.Command(exePath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow: false,
 	}
@@ -511,7 +511,11 @@ func StartGenerals(exePath string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("failed to start generals.exe: %w", err)
 	}
 
-	fmt.Printf("Started generals.exe (PID: %d)\n", cmd.Process.Pid)
+	if len(args) > 0 {
+		fmt.Printf("Started generals.exe (PID: %d) with args: %v\n", cmd.Process.Pid, args)
+	} else {
+		fmt.Printf("Started generals.exe (PID: %d)\n", cmd.Process.Pid)
+	}
 	return cmd, nil
 }
 
@@ -631,13 +635,13 @@ type ReplayResponse struct {
 	Header ReplayHeader `json:"Header"`
 }
 
-// ValidateReplayFile uploads the replay file to the API and checks if Version matches
-// Returns true if Version matches the expected version, false otherwise
-func ValidateReplayFile(filePath string, apiURL string, expectedVersion string) (bool, string, error) {
+// ValidateReplayFile uploads the replay file to the API and returns the version.
+// Returns the version string from the replay header.
+func ValidateReplayFile(filePath string, apiURL string) (string, error) {
 	// Open the file
 	file, err := os.Open(filePath)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to open file: %w", err)
+		return "", fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
@@ -648,23 +652,23 @@ func ValidateReplayFile(filePath string, apiURL string, expectedVersion string) 
 	// Add the file to the form
 	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
 	if err != nil {
-		return false, "", fmt.Errorf("failed to create form file: %w", err)
+		return "", fmt.Errorf("failed to create form file: %w", err)
 	}
 
 	_, err = io.Copy(part, file)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to copy file content: %w", err)
+		return "", fmt.Errorf("failed to copy file content: %w", err)
 	}
 
 	err = writer.Close()
 	if err != nil {
-		return false, "", fmt.Errorf("failed to close writer: %w", err)
+		return "", fmt.Errorf("failed to close writer: %w", err)
 	}
 
 	// Create HTTP request
 	req, err := http.NewRequest("POST", apiURL, &requestBody)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to create request: %w", err)
+		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
@@ -672,28 +676,27 @@ func ValidateReplayFile(filePath string, apiURL string, expectedVersion string) 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to send request: %w", err)
+		return "", fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	// Read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to read response: %w", err)
+		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return false, "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	// Parse JSON response
 	var replayResp ReplayResponse
 	if err := json.Unmarshal(body, &replayResp); err != nil {
-		return false, "", fmt.Errorf("failed to parse JSON response: %w", err)
+		return "", fmt.Errorf("failed to parse JSON response: %w", err)
 	}
 
-	actualVersion := replayResp.Header.Version
-	return actualVersion == expectedVersion, actualVersion, nil
+	return replayResp.Header.Version, nil
 }
 
 // MoveFileBackWithOldExtension moves a file from DirectoryA back to DirectoryB with .old extension

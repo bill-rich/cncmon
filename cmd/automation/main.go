@@ -43,7 +43,6 @@ type Config struct {
 	ReplayAPIURL         string
 	UseAPI               bool
 	MaxReplays           int
-	ExpectedVersion      string
 
 	// Monitor configuration
 	MonitorAPIURL       string
@@ -65,12 +64,19 @@ type ReplayInfo struct {
 	PresignedURL string `json:"presigned_url"`
 }
 
+// Supported game versions
+const (
+	Version104 = "Version 1.04"
+	Version106 = "Version 1.06"
+)
+
 // GeneralsProcess manages the generals.exe process lifecycle.
 type GeneralsProcess struct {
-	cmd     *exec.Cmd
-	exitCh  chan struct{}
-	exePath string
-	mu      sync.Mutex
+	cmd            *exec.Cmd
+	exitCh         chan struct{}
+	exePath        string
+	runningVersion string
+	mu             sync.Mutex
 }
 
 // NewGeneralsProcess creates a new process manager.
@@ -81,17 +87,29 @@ func NewGeneralsProcess(exePath string) *GeneralsProcess {
 	}
 }
 
-// Start launches generals.exe and sets up exit monitoring.
-func (gp *GeneralsProcess) Start() error {
+// Start launches generals.exe for the specified version and sets up exit monitoring.
+func (gp *GeneralsProcess) Start(version string) error {
 	gp.mu.Lock()
 	defer gp.mu.Unlock()
 
-	cmd, err := automation.StartGenerals(gp.exePath)
+	var cmd *exec.Cmd
+	var err error
+
+	switch version {
+	case Version106:
+		cmd, err = automation.StartGenerals(gp.exePath, "-mod", "Patch1.06.big")
+	case Version104:
+		cmd, err = automation.StartGenerals(gp.exePath)
+	default:
+		return fmt.Errorf("unsupported version: %s", version)
+	}
+
 	if err != nil {
 		return fmt.Errorf("starting generals.exe: %w", err)
 	}
 
 	gp.cmd = cmd
+	gp.runningVersion = version
 	gp.exitCh = make(chan struct{})
 
 	go func() {
@@ -100,6 +118,13 @@ func (gp *GeneralsProcess) Start() error {
 	}()
 
 	return nil
+}
+
+// RunningVersion returns the currently running game version.
+func (gp *GeneralsProcess) RunningVersion() string {
+	gp.mu.Lock()
+	defer gp.mu.Unlock()
+	return gp.runningVersion
 }
 
 // Initialize performs the initial setup: find window, wait, press escape.
@@ -572,6 +597,11 @@ func triggerReparse(ctx context.Context, gameSeed string, matchID int, blacklist
 	return false, nil
 }
 
+// isSupportedVersion checks if the version is supported (1.04 or 1.06)
+func isSupportedVersion(version string) bool {
+	return version == Version104 || version == Version106
+}
+
 // runAPIMode runs the automation in API mode.
 func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error {
 	gp := NewGeneralsProcess(config.GeneralsExe)
@@ -590,8 +620,10 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 	mon.Start()
 	defer mon.Stop()
 
-	fmt.Println("Starting generals.exe for API mode...")
-	if err := gp.Start(); err != nil {
+	// Start with Version 1.04 by default
+	currentVersion := Version104
+	fmt.Printf("Starting generals.exe for API mode (%s)...\n", currentVersion)
+	if err := gp.Start(currentVersion); err != nil {
 		return err
 	}
 	defer gp.Kill()
@@ -619,8 +651,8 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 				}
 			}
 
-			fmt.Println("Restarting generals.exe...")
-			if err := gp.Start(); err != nil {
+			fmt.Printf("Restarting generals.exe (%s)...\n", currentVersion)
+			if err := gp.Start(currentVersion); err != nil {
 				return err
 			}
 			if err := gp.Initialize(ctx, config.InitialWait); err != nil {
@@ -677,17 +709,41 @@ func runAPIMode(ctx context.Context, config *Config, blacklist *Blacklist) error
 		}
 		fmt.Printf("Downloaded: %s\n", replayPath)
 
-		// Validate replay
+		// Validate replay and get version
 		fmt.Println("Validating replay file...")
-		isValid, actualVersion, err := automation.ValidateReplayFile(replayPath, config.ReplayAPIURL, config.ExpectedVersion)
+		replayVersion, err := automation.ValidateReplayFile(replayPath, config.ReplayAPIURL)
 		if err != nil {
 			return fmt.Errorf("validating replay: %w", err)
 		}
-		if !isValid {
-			fmt.Printf("Warning: Version mismatch, Expected: %s Got: %s\n", config.ExpectedVersion, actualVersion)
-			blacklist.AddWithComment(currentMatchID, fmt.Sprintf("Version: %s", actualVersion), blacklistFile)
+
+		// Check if the version is supported
+		if !isSupportedVersion(replayVersion) {
+			fmt.Printf("Warning: Unsupported version: %s (supported: %s, %s)\n", replayVersion, Version104, Version106)
+			blacklist.AddWithComment(currentMatchID, fmt.Sprintf("Unsupported version: %s", replayVersion), blacklistFile)
 			continue
 		}
+
+		// Check if we need to switch versions
+		if replayVersion != currentVersion {
+			fmt.Printf("Version mismatch: replay is %s, running %s. Switching versions...\n", replayVersion, currentVersion)
+			gp.Kill()
+
+			// Wait a moment for the process to fully terminate
+			if err := sleepWithContext(ctx, 2*time.Second); err != nil {
+				return err
+			}
+
+			currentVersion = replayVersion
+			fmt.Printf("Starting generals.exe (%s)...\n", currentVersion)
+			if err := gp.Start(currentVersion); err != nil {
+				return err
+			}
+			if err := gp.Initialize(ctx, config.InitialWait); err != nil {
+				return err
+			}
+		}
+
+		fmt.Printf("Replay version: %s (running: %s)\n", replayVersion, currentVersion)
 
 		// Process the replay
 		result := processor.Process(ctx, currentMatchID)
@@ -760,10 +816,42 @@ func runDirectoryMode(ctx context.Context, config *Config, blacklist *Blacklist)
 		fileCount++
 		fmt.Printf("\n=== Processing file %d ===\n", fileCount)
 
-		// Start generals for this file
+		// Clear destination and move replay first (before starting generals)
+		fmt.Println("Clearing destination directory...")
+		if err := automation.DeleteAllRepFiles(config.DirectoryA); err != nil {
+			fmt.Printf("Error deleting files: %v\n", err)
+			continue
+		}
+
+		fmt.Println("Moving replay file...")
+		movedFile, err := automation.MoveOneRepFile(config.DirectoryB, config.DirectoryA)
+		if err != nil {
+			fmt.Printf("Error moving file: %v\n", err)
+			continue
+		}
+		fmt.Printf("Moved: %s\n", movedFile)
+
+		// Validate replay to get version before starting generals
+		fmt.Println("Validating replay file...")
+		replayVersion, err := automation.ValidateReplayFile(movedFile, config.ReplayAPIURL)
+		if err != nil {
+			fmt.Printf("Error validating: %v\n", err)
+			automation.MoveFileBackWithOldExtension(movedFile, config.DirectoryB)
+			continue
+		}
+
+		// Check if the version is supported
+		if !isSupportedVersion(replayVersion) {
+			fmt.Printf("Warning: Unsupported version: %s (supported: %s, %s)\n", replayVersion, Version104, Version106)
+			automation.MoveFileBackWithOldExtension(movedFile, config.DirectoryB)
+			continue
+		}
+		fmt.Printf("Replay version: %s\n", replayVersion)
+
+		// Start generals for this file with the appropriate version
 		gp := NewGeneralsProcess(config.GeneralsExe)
-		fmt.Println("Starting generals.exe...")
-		if err := gp.Start(); err != nil {
+		fmt.Printf("Starting generals.exe (%s)...\n", replayVersion)
+		if err := gp.Start(replayVersion); err != nil {
 			fmt.Printf("Error starting generals: %v\n", err)
 			continue
 		}
@@ -775,36 +863,6 @@ func runDirectoryMode(ctx context.Context, config *Config, blacklist *Blacklist)
 			}
 			fmt.Printf("Error initializing: %v\n", err)
 			continue
-		}
-
-		// Clear destination and move replay
-		fmt.Println("Clearing destination directory...")
-		if err := automation.DeleteAllRepFiles(config.DirectoryA); err != nil {
-			gp.Kill()
-			fmt.Printf("Error deleting files: %v\n", err)
-			continue
-		}
-
-		fmt.Println("Moving replay file...")
-		movedFile, err := automation.MoveOneRepFile(config.DirectoryB, config.DirectoryA)
-		if err != nil {
-			gp.Kill()
-			fmt.Printf("Error moving file: %v\n", err)
-			continue
-		}
-		fmt.Printf("Moved: %s\n", movedFile)
-
-		// Validate replay
-		fmt.Println("Validating replay file...")
-		isValid, actualVersion, err := automation.ValidateReplayFile(movedFile, config.ReplayAPIURL, config.ExpectedVersion)
-		if err != nil {
-			fmt.Printf("Error validating: %v\n", err)
-			automation.MoveFileBackWithOldExtension(movedFile, config.DirectoryB)
-			gp.Kill()
-			continue
-		}
-		if !isValid {
-			fmt.Printf("Warning: Version mismatch. Expected: %s, Got: %s\n", config.ExpectedVersion, actualVersion)
 		}
 
 		// Process the replay
@@ -898,10 +956,9 @@ func main() {
 
 func parseFlags() (*Config, error) {
 	var (
-		user                 = flag.String("user", "Bill", "Windows username for default paths")
-		expectedVersion      = flag.String("expected-version", "Version 1.04", "Expected replay version string")
-		directoryA           = flag.String("dir-a", "", "Directory A (destination)")
-		directoryB           = flag.String("dir-b", "", "Directory B (source)")
+		user       = flag.String("user", "Bill", "Windows username for default paths")
+		directoryA = flag.String("dir-a", "", "Directory A (destination)")
+		directoryB = flag.String("dir-b", "", "Directory B (source)")
 		generalsExe          = flag.String("generals-exe", "C:\\Program Files (x86)\\Origin Games\\Command and Conquer Generals Zero Hour\\Command and Conquer Generals Zero Hour\\generals.exe", "Path to generals.exe")
 		processName          = flag.String("process", "generals.exe", "Process name to monitor")
 		initialWait          = flag.Duration("initial-wait", 15*time.Second, "Wait time after starting")
@@ -976,7 +1033,6 @@ func parseFlags() (*Config, error) {
 		ReplayAPIURL:         *replayAPIURL,
 		UseAPI:               *useAPI,
 		MaxReplays:           *maxReplays,
-		ExpectedVersion:      *expectedVersion,
 
 		// Monitor configuration
 		MonitorAPIURL:       *monitorAPIURL,
@@ -997,7 +1053,7 @@ func printConfig(config *Config) {
 		fmt.Printf("Directory B (source): %s\n", config.DirectoryB)
 	}
 	fmt.Printf("Generals.exe: %s\n", config.GeneralsExe)
-	fmt.Printf("Expected version: %s\n", config.ExpectedVersion)
+	fmt.Printf("Supported versions: %s, %s\n", Version104, Version106)
 	fmt.Printf("Initial wait: %v\n", config.InitialWait)
 	fmt.Printf("Clicks before start: %d\n", len(config.ClicksBeforeStart))
 	fmt.Printf("Key after start: F (0x%02X)\n", VK_F)
@@ -1073,9 +1129,13 @@ func showHelp() {
 	fmt.Println()
 	fmt.Println("Usage: automation [flags]")
 	fmt.Println()
+	fmt.Println("Supported replay versions: Version 1.04, Version 1.06")
+	fmt.Println("  - Version 1.04 replays: generals.exe starts normally")
+	fmt.Println("  - Version 1.06 replays: generals.exe starts with -mod Patch1.06.big")
+	fmt.Println("  - The app automatically switches versions when needed")
+	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  -user string               Windows username for default paths (default: Bill)")
-	fmt.Println("  -expected-version string   Expected replay version string (default: Version 1.04)")
 	fmt.Println("  -dir-a string              Directory A - destination for replay files (default: C:\\Users\\<user>\\Documents\\...)")
 	fmt.Println("  -dir-b string              Directory B - source for replay files (default: C:\\Users\\<user>\\Desktop\\Replays)")
 	fmt.Println("  -generals-exe string       Path to generals.exe (required)")
