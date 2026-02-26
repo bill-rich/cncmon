@@ -32,6 +32,7 @@ const (
 type Config struct {
 	DirectoryA           string
 	DirectoryB           string
+	FastForward          bool
 	GeneralsExe          string
 	ProcessName          string
 	InitialWait          time.Duration
@@ -370,14 +371,16 @@ func (rp *ReplayProcessor) Process(ctx context.Context, matchID int) ProcessResu
 	fmt.Printf("Game seed: %s\n", result.GameSeed)
 
 	// Press F key
-	fmt.Println("Pressing 'F' key...")
-	if err := sleepWithContext(ctx, 500*time.Millisecond); err != nil {
-		result.Error = err
-		return result
-	}
-	if err := automation.PressKey(VK_F); err != nil {
-		result.Error = fmt.Errorf("pressing F key: %w", err)
-		return result
+	if rp.config.FastForward {
+		fmt.Println("Pressing 'F' key...")
+		if err := sleepWithContext(ctx, 500*time.Millisecond); err != nil {
+			result.Error = err
+			return result
+		}
+		if err := automation.PressKey(VK_F); err != nil {
+			result.Error = fmt.Errorf("pressing F key: %w", err)
+			return result
+		}
 	}
 
 	// Post-start clicks
@@ -956,9 +959,9 @@ func main() {
 
 func parseFlags() (*Config, error) {
 	var (
-		user       = flag.String("user", "Bill", "Windows username for default paths")
-		directoryA = flag.String("dir-a", "", "Directory A (destination)")
-		directoryB = flag.String("dir-b", "", "Directory B (source)")
+		user                 = flag.String("user", "Bill", "Windows username for default paths")
+		directoryA           = flag.String("dir-a", "", "Directory A (destination)")
+		directoryB           = flag.String("dir-b", "", "Directory B (source)")
 		generalsExe          = flag.String("generals-exe", "C:\\Program Files (x86)\\Origin Games\\Command and Conquer Generals Zero Hour\\Command and Conquer Generals Zero Hour\\generals.exe", "Path to generals.exe")
 		processName          = flag.String("process", "generals.exe", "Process name to monitor")
 		initialWait          = flag.Duration("initial-wait", 15*time.Second, "Wait time after starting")
@@ -978,6 +981,7 @@ func parseFlags() (*Config, error) {
 		monitorPollDelay    = flag.Duration("monitor-poll-delay", 50*time.Millisecond, "Delay between monitor memory polls")
 		monitorTimeout      = flag.Duration("monitor-timeout", 2*time.Minute, "Monitor timeout for inactivity")
 		monitorDebug        = flag.Bool("monitor-debug", false, "Enable monitor debug logging")
+		fastForward         = flag.Bool("fast-forward", true, "Fast forward game")
 	)
 	flag.Parse()
 
@@ -1022,6 +1026,7 @@ func parseFlags() (*Config, error) {
 	return &Config{
 		DirectoryA:           *directoryA,
 		DirectoryB:           *directoryB,
+		FastForward:          *fastForward,
 		GeneralsExe:          *generalsExe,
 		ProcessName:          *processName,
 		InitialWait:          *initialWait,
