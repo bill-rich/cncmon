@@ -329,36 +329,41 @@ func (m *Monitor) processMoneyMonitoring() int {
 			fmt.Println("Initiating graceful shutdown - waiting for queue to drain...")
 			close(shutdownRequested)
 
+			// Close the queue channel immediately so the worker knows no more
+			// items are coming and will exit once it finishes processing.
+			close(requestQueue)
+
 			drainTimeout := 30 * time.Second
-			drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
-			defer drainCancel()
+
+			// Wait for the worker to finish processing all remaining items.
+			// This is more reliable than polling len(requestQueue) because it
+			// also accounts for the item currently being sent.
+			workerDone := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(workerDone)
+			}()
 
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 
-			drained := false
-			for !drained {
-				queueDepth := len(requestQueue)
-				if queueDepth == 0 {
-					fmt.Println("Queue drained successfully")
-					drained = true
-					break
-				}
+			timer := time.NewTimer(drainTimeout)
+			defer timer.Stop()
 
+			for {
 				select {
-				case <-drainCtx.Done():
-					fmt.Printf("Queue drain timeout after %v. %d items remaining in queue.\n", drainTimeout, queueDepth)
-					drained = true
-					break
+				case <-workerDone:
+					fmt.Println("Queue drained successfully")
+					fmt.Println("Graceful shutdown complete")
+					return
+				case <-timer.C:
+					fmt.Printf("Queue drain timeout after %v.\n", drainTimeout)
+					fmt.Println("Graceful shutdown complete (with timeout)")
+					return
 				case <-ticker.C:
-					fmt.Printf("Waiting for queue to drain... %d items remaining\n", queueDepth)
+					fmt.Printf("Waiting for queue to drain... %d items remaining\n", len(requestQueue))
 				}
 			}
-
-			close(requestQueue)
-			fmt.Println("Waiting for worker to finish processing...")
-			wg.Wait()
-			fmt.Println("Graceful shutdown complete")
 		})
 	}
 
@@ -593,13 +598,14 @@ func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, grpcClient *GRPCClie
 	defer wg.Done()
 	const maxRetries = 3
 	const baseRetryDelay = 100 * time.Millisecond
+	const sendTimeout = 10 * time.Second
 
 	for req := range requestQueue {
 		var err error
 		retryCount := 0
 
 		for retryCount <= maxRetries {
-			err = sendMoneyDataGRPC(grpcClient, req.Seed, req.TimeCode, req.Current, req.Previous, req.IsFirstPoll)
+			err = sendMoneyDataGRPCWithTimeout(grpcClient, req, sendTimeout)
 			if err == nil {
 				if retryCount > 0 {
 					fmt.Printf("Money data sent successfully via gRPC after %d retries\n", retryCount)
@@ -637,6 +643,22 @@ func apiRequestWorker(requestQueue <-chan QueuedAPIRequest, grpcClient *GRPCClie
 			}
 			break
 		}
+	}
+}
+
+// sendMoneyDataGRPCWithTimeout wraps sendMoneyDataGRPC with a timeout so that
+// a blocked stream.Send() cannot stall the worker indefinitely.
+func sendMoneyDataGRPCWithTimeout(grpcClient *GRPCClient, req QueuedAPIRequest, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- sendMoneyDataGRPC(grpcClient, req.Seed, req.TimeCode, req.Current, req.Previous, req.IsFirstPoll)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("gRPC send timed out after %v: deadline exceeded", timeout)
 	}
 }
 
