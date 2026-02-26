@@ -354,6 +354,10 @@ func (m *Monitor) processMoneyMonitoring() int {
 				select {
 				case <-workerDone:
 					fmt.Println("Queue drained successfully")
+					// Signal server we're done sending.
+					if err := grpcClient.stream.CloseSend(); err != nil {
+						fmt.Printf("Warning: CloseSend failed: %v\n", err)
+					}
 					fmt.Println("Graceful shutdown complete")
 					return
 				case <-timer.C:
@@ -569,6 +573,18 @@ func createGRPCClient(addr string) (*GRPCClient, error) {
 		conn.Close()
 		return nil, fmt.Errorf("failed to create stream: %w", err)
 	}
+
+	// Drain server responses in background. The server sends a response for
+	// each request. If nobody reads them, gRPC's internal buffer fills up
+	// and stream.Send() blocks on the server side, which prevents the server
+	// from calling Recv(), which in turn blocks the client's Send().
+	go func() {
+		for {
+			if _, err := stream.Recv(); err != nil {
+				return
+			}
+		}
+	}()
 
 	return &GRPCClient{
 		conn:   conn,
