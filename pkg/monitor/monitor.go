@@ -704,8 +704,9 @@ func sendMoneyDataGRPC(grpcClient *GRPCClient, seed string, timeCode uint32, cur
 	defer grpcClient.mu.Unlock()
 
 	request := &player_money.MoneyDataRequest{
-		Seed:     seed,
-		Timecode: int64(timeCode),
+		Seed:      seed,
+		Timecode:  int64(timeCode),
+		ResetSeed: isFirstPoll,
 	}
 
 	if isFirstPoll || current.Money != previous.Money {
